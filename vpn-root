@@ -1,0 +1,409 @@
+#!/bin/bash
+# Root side of `vpn`: kill switch, reconnect watchdog, trusted networks, settings and profile management.
+# Called without a password through /etc/sudoers.d/vpn (this script only) - which is why nothing needs a terminal.
+#
+# The kill switch is one nftables table, loaded at boot (vpn-killswitch.service) and kept for good. It drops
+# everything that does not leave through the tunnel, except the handshake to the VPN servers, DHCP and
+# loopback - and except the interfaces in its `open` set. That set is the whole policy: an interface is open
+# when it is wired, when its Wi-Fi is trusted, or when the user released it with `vpn off`; it is closed
+# whenever a VPN is wanted (the marker) or the Wi-Fi is untrusted and auto-connect is on. The NetworkManager
+# dispatcher calls `netevent` at pre-up, before the interface is usable, so an untrusted network is shut
+# before its first packet - also before anyone is logged in. Closed is the default; events only open.
+#
+#   boot                 load the table (unit ExecStart) - a no-op while the kill switch setting is off or no profile exists
+#   unload               delete the table (unit ExecStop): the emergency exit next to `vpn killswitch off`
+#   netevent ACTION IFACE [UUID]   dispatcher: apply the policy to one interface (pre-up | up | pre-down | down)
+#   sync [--connect]     apply the policy to every active interface; --connect also starts the tunnel when one is wanted
+#   on [NAME]            a VPN is wanted (dispatcher vpn-up): write NAME to the marker, close the uplinks
+#   arm NAME             the user asked for NAME: marker, remember this network as manually chosen, close the uplinks
+#   off                  the user wants no VPN: delete the marker, release the network you are on until you change
+#                        network, stop the watchdog, open the uplinks
+#   status               on|off|disabled: is the uplink shut right now? (re-loads a missing table while the setting is on)
+#   watch [DELAY]        start the watchdog as a transient systemd unit (idempotent)
+#   unwatch              stop the watchdog (marker and kill switch stay)
+#   reconnect [DELAY]    the watchdog loop itself (runs inside the unit)
+#   trust add|remove SSID | trust set   the trusted Wi-Fi list (/etc/vpn/trusted; `set` reads the whole list on stdin)
+#   get KEY              read a setting (/etc/vpn/settings): killswitch (default on), autoconnect, autodisconnect, default
+#   set KEY VALUE        write a setting and apply it: killswitch on|off loads or removes the table at once, the others re-run the policy
+#   add NAME FILE        .ovpn to /etc/vpn/configs/NAME.ovpn, credentials (2 lines on stdin, optional) to
+#                        /etc/vpn/auth/<provider>, re-render the kill switch, import NetworkManager profile NAME
+#   remove NAME          delete profile and config (last profile of a provider: its credentials too), re-render the kill switch
+#   rebuild [NAME]       render the kill switch from every config (+ reload it if loaded); re-import NAME or all profiles
+#   has-auth PROV        exit 0 if credentials for that provider are stored
+set -euo pipefail
+ETC=/etc/vpn; CONF=$ETC/configs; AUTHD=$ETC/auth
+RULES=$ETC/killswitch.nft; TEMPLATE=$ETC/killswitch.nft.in
+TABLE="inet vpn_ks"
+SETTINGS=$ETC/settings          # killswitch=on|off (default on), autoconnect=on|off, autodisconnect=on|off, default=<profile>
+TRUSTED=$ETC/trusted            # trusted Wi-Fi networks, one SSID per line
+MARK=/run/vpn-killswitch.active      # exists = "a VPN is wanted"; contents = the wanted connection. World-readable
+OPEN=/run/vpn-killswitch.open        # exists = the table is loaded; contents = the open interfaces, one per line. World-readable
+MANUAL=/run/vpn-killswitch.manual    # the SSID on which the user last said on or off by hand: no automatics there until the network changes
+EVENT=/run/vpn-killswitch.event      # the last automatic decision (epoch, kind, SSID, profile) - the user side turns it into a toast
+UNIT=vpn-reconnect
+
+managed() { [[ -n "${1:-}" && -f "$CONF/$1.ovpn" ]]; }   # only profiles we imported; foreign NM VPNs are none of our business
+log() { logger -t vpn-root "$*" 2>/dev/null || true; }   # a missing journal must never abort a policy decision
+
+get_setting() { local v; v=$(grep -s "^$1=" "$SETTINGS" | tail -1 | cut -d= -f2- || true); case "$1" in killswitch) echo "${v:-on}" ;; *) echo "$v" ;; esac; }
+put_setting() {
+  install -d -m755 "$ETC"
+  { grep -sv "^$1=" "$SETTINGS" || true; echo "$1=$2"; } > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"; chmod 644 "$SETTINGS"
+}
+# An SSID is 32 arbitrary bytes and may contain a newline. `grep -F` reads a multi-line pattern as a LIST of
+# patterns, so "Hotel WiFi\nHome" would count as trusted if Home is (security review 09.09. 21:50).
+# Hence: a name with a newline is no name at all - ssid_of returns nothing, is_trusted refuses, verdict shuts.
+is_trusted() { [[ -n "${1:-}" && "$1" != *$'\n'* ]] && grep -qxF -- "$1" "$TRUSTED" 2>/dev/null; }
+ssid_of() {   # by UUID or name; empty for wired, empty for a name that does not fit on one line
+  local s; [[ -n "${1:-}" ]] || return 0
+  s=$(nmcli -g 802-11-wireless.ssid con show "$1" 2>/dev/null | sed 's/\\:/:/g' || true)
+  if [[ "$s" == *$'\n'* ]]; then log "$1: SSID contains a line break - treated as unnamed (shut)"; return 0; fi
+  printf '%s' "$s"
+}
+# The interfaces that carry traffic to the outside: every active connection that is not a VPN and not loopback.
+# One line each: IFACE<TAB>UUID<TAB>TYPE. Activating ones are included - that is the pre-up moment.
+uplinks()    { nmcli -t -f DEVICE,UUID,TYPE con show --active 2>/dev/null | awk -F: '$1!="" && $3!="vpn" && $3!="loopback" && !($3=="tun" && $1 ~ /^tun[0-9]+$/) {print $1 "\t" $2 "\t" $3}'; }   # tunN is the tunnel itself; other tun devices (tailscale0, tap0) are uplinks
+first_managed() { local f; for f in "$CONF"/*.ovpn; do [[ -f "$f" ]] && { basename "$f" .ovpn; return 0; }; done; return 1; }
+current_ssid() { local l; while IFS=$'\t' read -r i u t; do [[ "$t" == 802-11-wireless ]] && { ssid_of "$u"; return 0; }; done < <(uplinks); return 0; }
+table_loaded() { nft list table $TABLE &>/dev/null; }
+event() { printf '%s\t%s\t%s\t%s\n' "$(date +%s%N)" "$1" "$2" "${3:-}" > "$EVENT"; chmod 644 "$EVENT"; }
+managed_up()   { local n; for n in $(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="vpn"{print $1}'); do managed "$n" && return 0; done; return 1; }   # one of our tunnels is up or coming up
+managed_active() { local n t st; while IFS=: read -r n t st; do [[ "$t" == vpn && "$st" == activated ]] && managed "$n" && { echo "$n"; return 0; }; done < <(nmcli -t -f NAME,TYPE,STATE con show --active 2>/dev/null); return 1; }   # ... and really up: prints its name
+wifi_uplink()  { local i u t; while IFS=$'\t' read -r i u t; do [[ "$t" == 802-11-wireless ]] && return 0; done < <(uplinks); return 1; }
+tunnels_down() { local n; for n in $(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="vpn"{print $1}'); do managed "$n" && nmcli -w 0 con down "$n" >/dev/null 2>&1 || true; done; }   # -w 0: this may run inside a dispatcher script, which must not wait for NM
+
+# verdict IFACE UUID TYPE -> open|closed. Pure: reads the state, changes nothing.
+verdict() {
+  local ssid=""
+  [[ -e "$MARK" ]] && { echo closed; return; }            # a VPN is wanted: only the tunnel may carry traffic
+  [[ "$3" == 802-11-wireless ]] || { echo open; return; }   # wired, and anything else that is not Wi-Fi: left alone
+  ssid=$(ssid_of "$2")
+  [[ -n "$ssid" ]] || { [[ "$(cat "$MANUAL" 2>/dev/null || true)" == "*" ]] && echo open || echo closed; return; }   # a Wi-Fi we cannot name is not one we trust - unless the user released it (`vpn off` writes "*" there)
+  is_trusted "$ssid" && { echo open; return; }
+  [[ "$(cat "$MANUAL" 2>/dev/null || true)" == "$ssid" ]] && { echo open; return; }   # released by hand (`vpn off`) on this very network
+  [[ "$(get_setting autoconnect)" == on ]] && first_managed >/dev/null && { echo closed; return; }   # untrusted, VPN wanted by policy - and a profile exists to honour it; with no profile at all the policy cannot be met, so the user is not stranded
+  echo open
+}
+# decide IFACE UUID TYPE PHASE -> open|closed. The automatics first (they may write or delete the marker), then the verdict.
+# PHASE pre-up: NetworkManager is waiting for us, so nothing slow and no nmcli that changes state.
+decide() {
+  local iface=$1 uuid=$2 type=$3 phase=${4:-sync} ssid="" man def
+  if [[ "$type" == 802-11-wireless ]]; then
+    ssid=$(ssid_of "$uuid")
+    man=$(cat "$MANUAL" 2>/dev/null || true)
+    if [[ -n "$ssid" && -n "$man" && "$man" != "$ssid" ]]; then rm -f "$MANUAL"; man=""; fi   # a manual choice lasts for one network
+    if [[ -n "$ssid" && "$man" != "$ssid" ]]; then
+      if is_trusted "$ssid"; then
+        if [[ "$(get_setting autodisconnect)" == on ]]; then
+          if [[ -e "$MARK" ]]; then
+            rm -f "$MARK"; systemctl stop "$UNIT.service" 2>/dev/null || true
+            event disconnect "$ssid"; log "$iface \"$ssid\" trusted - auto-disconnect, network released"
+          fi
+          # The tunnel itself comes down at `up`, not at pre-up (NetworkManager is waiting for us there). By then
+          # the marker is already gone - pre-up removed it - so the test is "a managed tunnel is still up on a
+          # trusted network that wants none", not "the marker is there". Found 09.09. 18:14: the marker went, the
+          # interface opened, and proton-ch stayed connected through the whole visit at home.
+          if [[ "$phase" != pre-up ]] && managed_up; then
+            tunnels_down; log "$iface \"$ssid\" trusted - tunnel brought down"
+          fi
+        fi
+      elif [[ ! -e "$MARK" && "$(get_setting autoconnect)" == on ]]; then
+        def=$(get_setting default); managed "$def" || def=$(first_managed || true)   # same election as the user side: the first profile
+        if managed "$def"; then echo "$def" > "$MARK"; event connect "$ssid" "$def"; log "$iface \"$ssid\" untrusted - auto-connect $def, interface stays shut"
+        else event noprofile "$ssid"; log "$iface \"$ssid\" untrusted, auto-connect on, but no profile at all - nothing to connect, interface left open"; fi
+      fi
+    fi
+  fi
+  verdict "$iface" "$uuid" "$type"
+}
+
+# Render the open set into the table, atomically (one nft batch): flush, then add what is open now.
+apply_open() {   # reads IFACE names on stdin
+  local list; list=$(awk 'NF' | sort -u)
+  table_loaded || return 0   # nothing to apply without a table (setting off, or no profile yet)
+  # `if`, not `[[ ]] &&`: a false test as the last command of this group would fail the pipeline under
+  # pipefail, set -e would end the subshell, and the state file below would never be written.
+  { echo "flush set $TABLE open"
+    if [[ -n "$list" ]]; then printf 'add element %s open { %s }\n' "$TABLE" "$(printf '"%s"' $list | sed 's/""/", "/g')"; fi
+  } | nft -f -
+  printf '%s\n' "$list" > "$OPEN.tmp"; chmod 644 "$OPEN.tmp"; mv "$OPEN.tmp" "$OPEN"
+}
+# sync [--connect] [--phase PHASE] [--shut IFACE] [IFACE UUID TYPE]: run decide over every uplink (the given one
+# overrides or is added - at pre-up NetworkManager may not list it yet), write the open set, and with --connect
+# start the watchdog when a VPN is wanted and none is up. --shut IFACE takes that interface out no matter what
+# nmcli says: at pre-down and down the connection is still listed while it goes away, and the next network
+# gets its address before pre-up runs - a stale entry would be open for exactly those milliseconds.
+# Never --connect from `arm`: the user's own `nmcli con up` is already on its way, and two connects racing was
+# the 8 September 14:26 blackout.
+sync() {
+  local connect=0 phase=sync i u t v seen="" opened=""
+  # Self-heal: the setting says on, rules exist, the unit is not stopped on purpose, and yet no table - reload it
+  # (a flushed ruleset, or a first profile added after boot). Behind `systemctl stop vpn-killswitch` this stays off.
+  if [[ "$(get_setting killswitch)" != off && -s "$RULES" ]] && ! table_loaded && systemctl is-active -q vpn-killswitch.service 2>/dev/null; then load_rules || true; fi
+  while [[ $# -gt 0 ]]; do case "$1" in --connect) connect=1; shift ;; --phase) phase=$2; shift 2 ;; --shut) seen=$2; log "$2 -> closed (going down)"; shift 2 ;; *) break ;; esac; done
+  if [[ $# -ge 3 ]]; then v=$(decide "$1" "$2" "$3" "$phase"); seen="$1"; [[ "$v" == open ]] && opened+="$1"$'\n'; log "$1 -> $v"; fi
+  while IFS=$'\t' read -r i u t; do
+    [[ -n "$i" && "$i" != "$seen" ]] || continue
+    v=$(decide "$i" "$u" "$t" "$phase"); [[ "$v" == open ]] && opened+="$i"$'\n'
+  done < <(uplinks)
+  printf '%s' "$opened" | apply_open
+  if (( connect )) && [[ -e "$MARK" && "$phase" != pre-up ]] && ! managed_up; then   # ours only: a foreign NM VPN is none of our business
+    "$0" watch 0
+  fi
+}
+
+load_rules() {   # respects the killswitch setting; renders the open set from the current verdicts, so a reload never shuts an open uplink
+  if [[ "$(get_setting killswitch)" == "off" ]]; then
+    table_loaded && nft delete table $TABLE; rm -f "$OPEN"; return 0
+  fi
+  [[ -s "$RULES" ]] || { echo "No kill switch rules ($RULES) - add a profile first" >&2; return 1; }
+  local i u t list="" el="" tmp
+  while IFS=$'\t' read -r i u t; do [[ -n "$i" && "$(verdict "$i" "$u" "$t")" == open ]] && list+="$i"$'\n'; done < <(uplinks)
+  list=$(printf '%s' "$list" | awk 'NF' | sort -u)
+  if [[ -n "$list" ]]; then el="elements = { $(printf '"%s"' $list | sed 's/""/", "/g') }"; fi
+  tmp=$(mktemp /run/.vpn-ks.XXXXXX)
+  sed "s|@OPEN_ELEMENTS@|$el|" "$RULES" > "$tmp"
+  nft -f "$tmp"; rm -f "$tmp"
+  printf '%s\n' "$list" > "$OPEN.tmp"; chmod 644 "$OPEN.tmp"; mv "$OPEN.tmp" "$OPEN"
+}
+
+render_rules() {
+  local configs=("$CONF"/*.ovpn) endpoints ports
+  [[ -f "${configs[0]}" ]] || { rm -f "$RULES"; echo "No configs in $CONF - kill switch rules removed" >&2; return; }
+  endpoints=$(awk '$1=="remote"{print $2}' "${configs[@]}" | sort -u | while read -r h; do
+    if [[ "$h" =~ ^[0-9.]+$ ]]; then echo "$h"
+    else getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u | grep . || echo "warning: cannot resolve $h now - not in the kill switch until the next rebuild" >&2
+    fi
+  done | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n | paste -sd, | sed 's/,/, /g')
+  [[ -n "$endpoints" ]] || { echo "No resolvable server address in any config" >&2; return 1; }
+  ports=$(awk '$1=="remote"{print $3}' "${configs[@]}" | sort -un | paste -sd, | sed 's/,/, /g')
+  local tmp; tmp=$(mktemp "$ETC/.killswitch.XXXXXX")
+  # @OPEN_ELEMENTS@ stays in the rendered file (filled at load time); the syntax check runs on a copy without it
+  if ! sed -e "s|@ENDPOINTS@|$endpoints|" -e "s|@PORTS@|$ports|" "$TEMPLATE" > "$tmp" || ! sed 's|@OPEN_ELEMENTS@||' "$tmp" | nft -c -f -; then
+    rm -f "$tmp"; echo "Rendered rules are invalid - keeping the previous $RULES" >&2; return 1
+  fi
+  chmod 644 "$tmp"; mv "$tmp" "$RULES"
+  echo "Kill switch: $(wc -w <<<"$endpoints") IPs, ports $ports"
+  [[ -e "$OPEN" ]] && { load_rules; echo "Kill switch reloaded"; } || true
+}
+
+import_profile() {
+  local name=$1 f=$CONF/$1.ovpn prov=${1%%-*} u p
+  [[ -f "$AUTHD/$prov" ]] || { echo "Credentials missing: $AUTHD/$prov" >&2; return 1; }
+  u=$(sed -n 1p "$AUTHD/$prov"); p=$(sed -n 2p "$AUTHD/$prov")
+  nmcli -t -f NAME con show | grep -qx "$name" && nmcli con delete "$name" >/dev/null
+  nmcli con import type openvpn file "$f" >/dev/null     # the profile is then named after the file without .ovpn = NAME
+  nmcli con mod "$name" vpn.user-name "$u" +vpn.data password-flags=0 vpn.secrets "password=$p" \
+    connection.autoconnect no ipv4.dns-priority -1 \
+    vpn.persistent yes +vpn.data "ping=10, ping-restart=60" \
+    +vpn.data "mssfix=1400, tunnel-mtu=1400"   # a Wi-Fi path MTU can be below 1500 (measured 1438; Proton ships mssfix 0, which broke HTTPS)
+  nmcli con mod "$name" ipv6.method disabled 2>/dev/null || true
+  echo "Profile: $name"
+}
+
+do_boot() {
+  local n o
+  [[ "$(get_setting killswitch)" != off ]] || { log "kill switch setting is off - table not loaded"; return 0; }
+  [[ -s "$RULES" ]] || { log "no profile yet - kill switch not loaded (add one, then: vpn-root boot)"; return 0; }
+  # A tunnel that is up while the table comes back (killswitch off -> on) is wanted: adopt it, or the uplink
+  # would be rendered open beside a running tunnel and a drop would leave it open with no watchdog (review 09.09.)
+  if [[ ! -e "$MARK" ]] && n=$(managed_active); then echo "$n" > "$MARK"; log "adopted the running tunnel $n"; fi
+  load_rules; sync --connect
+  o=$(paste -sd' ' "$OPEN" 2>/dev/null || true); log "kill switch loaded (open: ${o:-none})"
+}
+unload_table() { table_loaded && nft delete table $TABLE; rm -f "$OPEN"; }
+do_unload() {   # the emergency exit (unit ExecStop): no VPN wanted any more, and nothing may reload the table behind it
+  systemctl stop "$UNIT.service" 2>/dev/null || true; rm -f "$MARK"
+  unload_table
+  log "kill switch table removed, VPN no longer wanted"
+}
+
+# One decision at a time: the dispatcher, the watchdog and the user's own command may run concurrently, and a
+# set computed from a state that changed underneath would be applied late. Long-running verbs stay outside.
+LOCK=/run/vpn-killswitch.lock
+case "${1:-}" in boot|unload|netevent|sync|on|arm|off|status|set|trust) exec 9>"$LOCK"; flock -w 5 9 || log "lock: waited 5 s, going ahead" ;; esac
+
+case "${1:-}" in
+  boot)
+    do_boot
+    ;;
+  unload)
+    do_unload
+    ;;
+  netevent)
+    action=${2:-}; iface=${3:-}; uuid=${4:-}
+    [[ -n "$iface" ]] || exit 0
+    case "$action" in
+      pre-down|down) sync --shut "$iface" ;;   # out of the set before the interface can carry the next network's first packet
+      pre-up|up)
+        type=$(nmcli -g connection.type con show "$uuid" 2>/dev/null || true)
+        [[ -n "$type" && "$type" != vpn && "$type" != loopback ]] || exit 0   # NM 1.58 dispatches lo as a connection too: nothing to decide there
+        [[ "$type" == tun && "$iface" == tun[0-9]* ]] && exit 0   # the tunnel's own tun0 shows up as an external `tun` device: not an uplink (other tun devices are)
+        if [[ "$action" == up ]]; then sync --connect --phase up "$iface" "$uuid" "$type"
+        else sync --phase pre-up "$iface" "$uuid" "$type"; fi ;;
+    esac
+    ;;
+  sync)
+    sync "${@:2}"
+    ;;
+  on)
+    if [[ -n "${2:-}" ]] && ! managed "$2"; then exit 0; fi   # dispatcher fires for every NM VPN - ignore foreign ones
+    if [[ ! -e "$MARK" ]]; then s=$(current_ssid); if [[ -n "$s" ]]; then printf '%s\n' "$s" > "$MANUAL"; fi; fi   # nobody armed this tunnel: brought up by hand (nmcli), so no automatics on this network
+    if [[ -n "${2:-}" ]]; then echo "$2" > "$MARK"; else [[ -e "$MARK" ]] || : > "$MARK"; fi
+    [[ -e "$OPEN" ]] || ! systemctl is-active -q vpn-killswitch.service 2>/dev/null || load_rules || true   # belt and braces - but never behind `systemctl stop`
+    sync
+    log "kill switch $(get_setting killswitch)${2:+ ($2)}"
+    ;;
+  arm)
+    managed "${2:-}" || { echo "arm NAME (a managed profile)" >&2; exit 1; }
+    [[ -s "$RULES" || "$(get_setting killswitch)" == "off" ]] || { echo "No kill switch rules ($RULES) - run: vpn-root rebuild" >&2; exit 1; }
+    echo "$2" > "$MARK"
+    s=$(current_ssid); if [[ -n "$s" ]]; then printf '%s\n' "$s" > "$MANUAL"; else rm -f "$MANUAL"; fi
+    [[ -e "$OPEN" ]] || ! systemctl is-active -q vpn-killswitch.service 2>/dev/null || load_rules || true
+    sync
+    ;;
+  off)
+    rm -f "$MARK"
+    s=$(current_ssid)
+    if [[ -n "$s" ]]; then printf '%s\n' "$s" > "$MANUAL"
+    elif wifi_uplink; then printf '*\n' > "$MANUAL"   # a Wi-Fi we cannot name: released all the same, until a named network comes up
+    else rm -f "$MANUAL"; fi
+    systemctl stop "$UNIT.service" 2>/dev/null || true
+    sync
+    log "no VPN wanted - network released${s:+ (\"$s\", until the next network)}"
+    ;;
+  status)
+    [[ "$(get_setting killswitch)" != off ]] || { echo disabled; exit 1; }
+    if ! table_loaded && [[ -s "$RULES" ]] && systemctl is-active -q vpn-killswitch.service 2>/dev/null; then load_rules && sync && log "kill switch table was gone - restored"; fi
+    table_loaded || { echo off; exit 1; }
+    shut=0; while IFS=$'\t' read -r i u t; do [[ -n "$i" ]] && ! grep -qxF -- "$i" "$OPEN" 2>/dev/null && shut=1; done < <(uplinks)
+    if (( shut )); then echo on; else echo off; exit 1; fi
+    ;;
+  get)
+    [[ "${2:-}" =~ ^[a-z]+$ ]] || { echo "get KEY" >&2; exit 1; }   # KEY becomes a grep pattern
+    get_setting "$2"
+    ;;
+  set)
+    key=${2:-}; val=${3:-}
+    case "$key=$val" in
+      killswitch=on|killswitch=off|autoconnect=on|autoconnect=off|autodisconnect=on|autodisconnect=off) ;;
+      default=*) [[ -z "$val" ]] || managed "$val" || { echo "default: '$val' is not a profile" >&2; exit 1; } ;;
+      *) echo "set killswitch|autoconnect|autodisconnect on|off, set default NAME" >&2; exit 1 ;;
+    esac
+    put_setting "$key" "$val"
+    log "setting $key=$val"
+    case "$key=$val" in
+      killswitch=off) unload_table; log "kill switch off - table removed, marker and watchdog untouched" ;;   # a printer needs the LAN, not a forgotten VPN
+      killswitch=on)  do_boot ;;
+      default=*)      sync --connect ;;                    # the target changed, the user's manual choice did not
+      *)              rm -f "$MANUAL"; sync --connect ;;   # an automation switch flipped is a new intent: it takes effect right now, past a manual on/off on this network
+    esac
+    ;;
+  trust)
+    op=${2:-}; ssid=${3:-}
+    install -d -m755 "$ETC"
+    man=$(cat "$MANUAL" 2>/dev/null || true); before=0; if [[ -n "$man" ]] && is_trusted "$man"; then before=1; fi
+    case "$op" in
+      add|remove)
+        [[ -n "$ssid" && "$ssid" != *$'\n'* ]] || { echo "trust $op SSID" >&2; exit 1; }
+        { grep -svxF -- "$ssid" "$TRUSTED" || true; if [[ "$op" == add ]]; then printf '%s\n' "$ssid"; fi; } > "$TRUSTED.tmp" ;;
+      set)  awk 'NF && !seen[$0]++' > "$TRUSTED.tmp" ;;   # the whole list on stdin, one SSID per line
+      *)    echo "trust add|remove SSID, trust set (stdin)" >&2; exit 1 ;;
+    esac
+    chmod 644 "$TRUSTED.tmp"; mv "$TRUSTED.tmp" "$TRUSTED"
+    log "trusted networks: $(paste -sd, "$TRUSTED" | sed 's/,/, /g')"
+    # Changing the trust of THE network the user acted on by hand is a new intent there: the earlier `vpn off`
+    # no longer pauses the automatics (21:00). Trusting some other network from the hotel must not touch it.
+    after=0; if [[ -n "$man" ]] && is_trusted "$man"; then after=1; fi
+    [[ "$before" == "$after" ]] || rm -f "$MANUAL"
+    sync --connect
+    ;;
+  watch)
+    [[ -e "$MARK" ]] || exit 0
+    systemctl is-active -q "$UNIT.service" && exit 0
+    systemd-run -q --unit="$UNIT" --collect --description="VPN reconnect watchdog" "$0" reconnect "${2:-5}"
+    ;;
+  unwatch)
+    systemctl stop "$UNIT.service" 2>/dev/null || true
+    ;;
+  reconnect)
+    # Runs until the wanted connection is back up or the user says `vpn off` (marker gone).
+    # The uplink stays shut the whole time - nothing goes past the tunnel. The handshake itself is allowed by IP.
+    sleep "${2:-5}"   # after a switch via `vpn on xy` the new profile needs a moment before it reports "activating"; 0 from the dispatcher
+    n=0
+    while [[ -e "$MARK" ]]; do
+      name=$(<"$MARK"); managed "$name" || exit 0
+      table_loaded || ! systemctl is-active -q vpn-killswitch.service 2>/dev/null || load_rules || true   # a flushed ruleset must not leave us open while retrying (unless the unit was stopped on purpose)
+      if managed_active >/dev/null; then exit 0; fi   # ours and really up; "activating" or a foreign VPN keeps us waiting
+      (( n++ % 6 == 0 )) && log "tunnel down - trying $name (attempt $n)"
+      if nmcli -w 40 con up "$name" >/dev/null 2>&1; then log "$name reconnected"; exit 0; fi
+      sleep 10
+    done
+    ;;
+  add)
+    name=${2:-}; f=${3:-}
+    [[ "$name" =~ ^[a-z0-9]+-[a-z0-9]+$ ]] || { echo "Name must be <provider>-<country>, lowercase, one dash: '$name'" >&2; exit 1; }
+    [[ -f "$f" ]] || { echo "File not found: $f" >&2; exit 1; }
+    grep -q '^remote ' "$f" || { echo "Not an OpenVPN config (no remote line): $f" >&2; exit 1; }
+    awk '$1=="remote"{print $2, $3}' "$f" | grep -qvE '^[A-Za-z0-9.-]+ [0-9]{1,5}$' && { echo "Unexpected remote host/port token in $f" >&2; exit 1; }
+    if awk '$1=="remote"{print $2}' "$f" | grep -qvE '^[0-9.]+$'; then
+      echo "warning: this config names its servers by host name. The kill switch blocks DNS on a shut interface, so this profile can only connect from an open network (trusted Wi-Fi, or after vpn off). A config with IP addresses works everywhere." >&2
+    fi
+    prov=${name%%-*}
+    if [[ ! -t 0 ]]; then   # credentials optionally on stdin (never as an argument - that would show up in `ps`)
+      IFS= read -r u || true; IFS= read -r p || true
+      if [[ -n "${u:-}" && -n "${p:-}" ]]; then install -d -m700 "$AUTHD"; printf '%s\n%s\n' "$u" "$p" > "$AUTHD/$prov"; chmod 600 "$AUTHD/$prov"; echo "Credentials: $AUTHD/$prov"; fi
+    fi
+    [[ -f "$AUTHD/$prov" ]] || { echo "Credentials for '$prov' missing (2 lines user/password on stdin)" >&2; exit 1; }
+    install -d -m755 "$CONF"
+    bak=""; [[ -f "$CONF/$name.ovpn" ]] && { bak=$(mktemp); cp "$CONF/$name.ovpn" "$bak"; }
+    install -m600 "$f" "$CONF/$name.ovpn"; echo "Config: $CONF/$name.ovpn"
+    if ! { render_rules && import_profile "$name"; }; then   # roll back so no orphan config poisons later rebuilds
+      if [[ -n "$bak" ]]; then cp "$bak" "$CONF/$name.ovpn"; else rm -f "$CONF/$name.ovpn"; fi
+      render_rules >/dev/null 2>&1 || true
+      echo "Adding $name failed - config rolled back" >&2; exit 1
+    fi
+    [[ -n "$bak" ]] && rm -f "$bak"
+    [[ -n "$(get_setting default)" ]] || put_setting default "$name"   # the first profile becomes the default
+    if [[ ! -e "$OPEN" && "$(get_setting killswitch)" != off ]]; then   # the first profile: the table could not be loaded at boot (no rules yet) - load it now
+      systemctl start vpn-killswitch.service 2>/dev/null || true; [[ -e "$OPEN" ]] || load_rules || true; sync --connect
+    fi
+    log "profile $name added"
+    ;;
+  remove)
+    name=${2:-}; [[ -n "$name" ]] || { echo "remove NAME" >&2; exit 1; }
+    # Only profiles we imported: this runs as root without a password, so it must never be able to delete the
+    # Wi-Fi connection or any other NM profile by name - and never a file outside configs/ (the name is a path piece).
+    [[ "$name" =~ ^[a-z0-9]+-[a-z0-9]+$ ]] || { echo "Not a profile name: '$name'" >&2; exit 1; }
+    managed "$name" || { echo "Not a tun0 VPN profile: '$name' (no $CONF/$name.ovpn)" >&2; exit 1; }
+    nmcli -t -f NAME con show | grep -qx "$name" && nmcli con delete "$name" >/dev/null && echo "Profile deleted: $name"
+    rm -f "$CONF/$name.ovpn"
+    prov=${name%%-*}
+    if ! ls "$CONF"/"$prov"-*.ovpn >/dev/null 2>&1 && [[ -f "$AUTHD/$prov" ]]; then   # last profile of this provider: forget its credentials
+      rm -f "$AUTHD/$prov"; echo "Credentials for '$prov' removed (no profile left)"
+    fi
+    if [[ "$(get_setting default)" == "$name" ]]; then put_setting default "$(first_managed || true)"; fi   # the next profile becomes the default, so auto-connect keeps a target
+    render_rules
+    [[ -s "$RULES" ]] || do_unload   # nothing left to tunnel through: a table with no way out would only strand the user
+    log "profile $name removed"
+    ;;
+  rebuild)
+    render_rules
+    rc=0
+    live=$(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="vpn"{print $1}')
+    for f in "$CONF"/*.ovpn; do
+      [[ -f "$f" ]] || continue
+      n=$(basename "$f" .ovpn); [[ -z "${2:-}" || "$2" == "$n" ]] || continue
+      if grep -qx "$n" <<<"$live"; then echo "Profile: $n (connected - left untouched, settings apply on next connect)"; continue; fi
+      import_profile "$n" || { echo "Profile: $n FAILED" >&2; rc=1; }
+    done
+    exit $rc
+    ;;
+  has-auth)
+    [[ "${2:-}" =~ ^[a-z0-9]+$ && -f "$AUTHD/$2" ]]   # provider names are [a-z0-9]+, nothing else reaches the file test
+    ;;
+  *)
+    echo "Usage: vpn-root boot|unload|netevent pre-up|up|pre-down|down IFACE UUID|sync [--connect]|on [NAME]|arm NAME|off|status|watch [DELAY]|unwatch|reconnect [DELAY]|trust add|remove SSID|trust set|get KEY|set KEY VALUE|add NAME FILE|remove NAME|rebuild [NAME]|has-auth PROVIDER" >&2
+    exit 2
+    ;;
+esac

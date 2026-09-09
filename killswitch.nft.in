@@ -1,0 +1,52 @@
+#!/usr/bin/nft -f
+# tun0 VPN kill switch. Loaded at boot by vpn-killswitch.service (vpn-root boot) and kept for good.
+# The principle: outbound traffic may only go through the tunnel (tun*), plus the handshake to the VPN
+# servers themselves - unless the interface is listed in the `open` set. That set is the whole policy:
+# vpn-root puts an interface there when it is wired, when its Wi-Fi is trusted, or when the user released
+# it with `vpn off`; it leaves it out when a VPN is wanted or the Wi-Fi is untrusted with auto-connect on.
+# The NetworkManager dispatcher decides at pre-up, before the interface is usable, so an untrusted network
+# never sees a first packet - not even before anyone is logged in. If the tunnel goes away the table stays
+# up and the interface stays out of the set -> no network, until `vpn off` or the watchdog brings it back.
+# Template: `vpn-root rebuild` replaces @ENDPOINTS@/@PORTS@ with the remote lines of EVERY .ovpn in
+# /etc/vpn/configs/ (host names are resolved at that point); @OPEN_ELEMENTS@ is filled at load time.
+
+table inet vpn_ks
+delete table inet vpn_ks
+
+table inet vpn_ks {
+	set endpoints {
+		type ipv4_addr
+		elements = { @ENDPOINTS@ }
+	}
+
+	# Interfaces that may carry traffic outside the tunnel. Empty at boot: nothing is open until the
+	# dispatcher has looked at the network.
+	set open {
+		type ifname
+		@OPEN_ELEMENTS@
+	}
+
+	chain output {
+		type filter hook output priority 0; policy drop;
+
+		oifname "lo" accept
+		oifname "tun*" accept
+		oifname @open accept
+
+		# OpenVPN handshake to the VPN servers (ports taken from the .ovpn; UDP and TCP, depending on proto)
+		ip daddr @endpoints udp dport { @PORTS@ } accept
+		ip daddr @endpoints tcp dport { @PORTS@ } accept
+
+		# DHCP, so Wi-Fi can keep and renew its address
+		udp sport 68 udp dport 67 accept
+
+		# IPv6 housekeeping only: neighbour discovery, router advertisements, MLD, DHCPv6. Not the whole link-local
+		# range - that let mDNS, LLMNR and SSDP out on a shut interface (found in the review of 9 September 2026).
+		# The providers do not tunnel IPv6; on an open interface the @open rule above lets everything through anyway.
+		icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept
+		ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept
+
+		# Reject everything else visibly, so programs fail at once instead of hanging in timeouts
+		counter reject with icmpx type admin-prohibited
+	}
+}

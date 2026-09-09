@@ -1,0 +1,2 @@
+# tun0 VPN (kill switch, watchdog, profiles): @USER@ may run exactly this one script as root without a password.
+@USER@ ALL=(root) NOPASSWD: /usr/local/bin/vpn-root

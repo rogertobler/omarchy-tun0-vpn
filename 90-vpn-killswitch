@@ -1,0 +1,36 @@
+#!/bin/bash
+# NetworkManager dispatcher for tun0 VPN. Installed three times: here in dispatcher.d/ (up, down, vpn-up,
+# vpn-down) and as symlinks in dispatcher.d/pre-up.d/ and pre-down.d/. pre-up and pre-down are the moments
+# NetworkManager waits for a script: before it declares an interface usable, and before it takes one down.
+# So the kill switch decision lands before the first packet of a network, also before login, and an interface
+# is shut again before it can carry the next network's first packet.
+#   pre-up | up          an ordinary interface (Wi-Fi, wired): vpn-root applies the policy - open it in the kill
+#                        switch if the network is trusted or wired, keep it shut if a VPN is wanted or the Wi-Fi is
+#                        untrusted with auto-connect on. `up` also starts the tunnel when one is wanted.
+#   pre-down | down      the interface is shut again, whatever NetworkManager still lists for it
+#   vpn-up               a tunnel came up: marker, uplinks shut (belt and braces, in case it was not started via `vpn on`)
+#   vpn-down             do NOT clean up - NetworkManager reports vpn-down for a drop as well as for an intended
+#                        disconnect. If the marker is there (= the user wanted a VPN), start the reconnect watchdog.
+#                        Only `vpn off` lifts it.
+ROOT=/usr/local/bin/vpn-root
+[[ -x "$ROOT" ]] || exit 0
+managed() { [[ -f "/etc/vpn/configs/${CONNECTION_ID:-}.ovpn" ]]; }   # only profiles managed by vpn; foreign VPNs untouched
+
+case "$2" in
+  pre-up|up|pre-down|down)
+    [[ -n "${CONNECTION_UUID:-}" ]] || exit 0
+    exec "$ROOT" netevent "$2" "$1" "$CONNECTION_UUID"   # vpn-root checks the connection type itself (a Wi-Fi named like a profile is still a Wi-Fi)
+    ;;
+  vpn-up)
+    managed || exit 0
+    "$ROOT" on "${CONNECTION_ID:-}"
+    ;;
+  vpn-down)
+    managed || exit 0
+    if [[ -e /run/vpn-killswitch.active ]]; then
+      logger -t vpn-root "${CONNECTION_ID:-VPN} down - uplinks stay shut, starting watchdog"
+      "$ROOT" watch
+    fi
+    ;;
+esac
+exit 0

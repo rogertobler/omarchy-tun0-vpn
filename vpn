@@ -1,0 +1,686 @@
+#!/bin/bash
+# tun0 VPN, user side: OpenVPN profiles in NetworkManager named <provider>-<country> (proton-ch, mullvad-ch, ...),
+# with an nftables kill switch and a reconnect watchdog (root side: /usr/local/bin/vpn-root, password-less via sudoers).
+#
+#   vpn on [NAME|COUNTRY]  connect (no argument: default); COUNTRY alone = <provider of default>-COUNTRY; switches without a gap
+#   vpn off                disconnect; releases the network you are on (until you change network)
+#   vpn toggle             on (default) or off
+#   vpn status             state + public IP + country/city/provider as seen by ipinfo.io
+#   vpn list               profiles (* active, = default)
+#   vpn default [NAME]     show / set the default (/etc/vpn/settings, written through vpn-root)
+#   vpn add [FILE]         add a profile - gum wizard (file / clipboard / path, name, credentials); from the menu in a floating terminal
+#   vpn remove [NAME]      remove a profile (without NAME: pick from menu)
+#   vpn killswitch [on|off|toggle]   show / set the kill switch setting (default on; off = VPN without blocking, e.g. for LAN printers)
+#   vpn trust [add|remove|edit] [SSID]   trusted Wi-Fi networks (default: the one you are on; edit = TUI); vpn autoconnect|autodisconnect [on|off|toggle]
+#                          the list and both switches live in /etc/vpn: the dispatcher applies them as root, at pre-up, before login
+#   vpn menu               open the Omarchy menu (predecessor of the panel); vpn recent = last used profiles
+#   vpn version            the version of the installed plugin, read from its manifest.json
+#   vpn menu-write | indicator | auto   internal: menu block, bar JSON (polled every 5 s); auto turns the dispatcher's last decision into a toast
+#   vpn is-on | is-wanted | is-active NAME | is-default NAME     conditions for the menu (exit code)
+# Full documentation: README.md in this repository.
+set -uo pipefail
+KS=/usr/local/bin/vpn-root
+MARK=/run/vpn-killswitch.active
+CFG_DIR=$HOME/.config/vpn              # only `recent` lives here; the policy state is root's (below)
+MENU_FILE=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
+PLUGIN_ID=rogertobler.tun0-vpn
+PLUGIN_DIR=$HOME/.config/omarchy/plugins/$PLUGIN_ID
+# Policy state belongs to root: the dispatcher decides at pre-up, before login, and must not read a home
+# directory. All of it is world-readable, so the poll never needs sudo; writing goes through vpn-root.
+SETTINGS_FILE=/etc/vpn/settings        # autoconnect=on|off, autodisconnect=on|off, default=<profile>, killswitch=on|off
+TRUSTED_FILE=/etc/vpn/trusted          # trusted Wi-Fi networks, one SSID per line
+OPEN_FILE=/run/vpn-killswitch.open     # exists = the kill switch table is loaded; contents = the interfaces allowed past it
+EVENT_FILE=/run/vpn-killswitch.event   # the dispatcher's last automatic decision: epoch, kind, SSID, profile
+RECENT_FILE=$CFG_DIR/recent            # most recently used profiles, newest first, at most 5
+AUTO_STATE=${XDG_RUNTIME_DIR:-/tmp}/vpn-auto   # the event that was already turned into a toast
+SELF=$(readlink -f "$0")
+
+CONF_DIR=/etc/vpn/configs
+
+ks()       { sudo -n "$KS" "$@"; }
+ks_setting() { user_setting killswitch; }   # empty = on
+uplink() { nmcli -t -f TYPE,DEVICE con show --active 2>/dev/null | awk -F: '$1!="vpn" && $1!="loopback" && $1!="tun" && $2!="" {print $2; exit}'; }
+# on = the uplink is shut and only the tunnel may carry traffic (a VPN is wanted, or untrusted Wi-Fi with auto-connect on);
+# off = the uplink is open; disabled = the setting is off, no table. Read from root's state file - no sudo on a poll.
+# unloaded = the setting is on but no table is loaded (no profile yet, or the unit was stopped): nothing is blocked.
+ks_state() {
+  local up
+  if [[ "$(ks_setting)" == "off" ]]; then echo "disabled"
+  elif [[ ! -e "$OPEN_FILE" ]]; then echo "unloaded"
+  else up=$(uplink); if [[ -n "$up" ]] && ! grep -qxF -- "$up" "$OPEN_FILE" 2>/dev/null; then echo "on"; else echo "off"; fi; fi
+}
+# notify [-u urgency] HEADLINE [TEXT] [--exec CMD ARGS...]  -> Omarchy-styled toast, optional action button
+# VPN_QUIET=1 (set by the panel while it is open) drops the normal toasts - the panel shows the result
+# itself, a toast on top of it only covers it. Critical ones still get through: they report a state the
+# panel cannot show (rules failed to load, kill switch stuck) and may arrive after the panel is closed.
+notify() {
+  local u=normal; if [[ "${1:-}" == "-u" ]]; then u=$2; shift 2; fi
+  [[ -n "${VPN_QUIET:-}" && "$u" != critical ]] && return 0
+  omarchy-notification-send --app-name VPN -g "󰦝" -u "$u" "$@" 2>/dev/null || true
+}
+die_unknown() { echo "Unknown: '$1'. Available: $(connections | paste -sd' ')" >&2; exit 1; }
+# Visible error inside the gum wizards - a plain echo scrolls past unnoticed between the styled prompts.
+err() { gum style --foreground 1 "$*" 2>/dev/null || printf '%s\n' "$*" >&2; }
+
+# The wizards run in a floating terminal. Omarchy's own wrapper prints the Omarchy logo there;
+# this is the plugin's window, so it prints the plugin's name in the same block font (figlet
+# "Delta Corps Priest 1", the family of Omarchy's logo.txt - the font has no digits, the zero is
+# drawn by hand). Green through the plain ANSI code, so it follows the terminal theme like Omarchy's.
+logo() {
+  clear
+  printf '\033[32m'
+  cat <<'ART'
+    ███     ███    █▄  ███▄▄▄▄    ▄██████▄        ▄█    █▄     ▄███████▄ ███▄▄▄▄
+▀█████████▄ ███    ███ ███▀▀▀██▄ ███  ▄████      ███    ███   ███    ███ ███▀▀▀██▄
+   ▀███▀▀██ ███    ███ ███   ███ ███  █▀███      ███    ███   ███    ███ ███   ███
+    ███   ▀ ███    ███ ███   ███ ███ ▄█ ███      ███    ███   ███    ███ ███   ███
+    ███     ███    ███ ███   ███ ███ █▀ ███      ███    ███ ▀█████████▀  ███   ███
+    ███     ███    ███ ███   ███ ███▄█  ███      ███    ███   ███        ███   ███
+    ███     ███    ███ ███   ███ ████▀  ███      ███    ███   ███        ███   ███
+   ▄████▀   ████████▀   ▀█   █▀   ▀██████▀        ▀██████▀   ▄████▀       ▀█   █▀
+ART
+  printf '\033[0m\n\n'
+}
+# Re-run ourselves in a floating terminal with that logo and Omarchy's "press any key" ending.
+# Same launch line as omarchy-launch-floating-terminal-with-presentation, which hardcodes its own logo.
+present() {
+  source omarchy-restart-gum 2>/dev/null || true   # gum colours of the current theme, not the login-time one
+  local q; printf -v q '%q ' "$SELF" "$@"
+  exec setsid uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.terminal --title="tun0 VPN" \
+    -e bash -c "$(printf '%q' "$SELF") logo; $q; if (( \$? != 130 )); then omarchy-show-done; fi"
+}
+
+# Connections = every NetworkManager profile of type vpn
+# Managed profiles = NetworkManager vpn profiles that have a config in /etc/vpn/configs (foreign VPNs are left alone).
+# Snapshot once per invocation: nmcli is a D-Bus round trip and the indicator polls every 5 s.
+connections() {
+  if [[ -z "${_cons+x}" ]]; then
+    _cons=$(nmcli -t -f NAME,TYPE con show 2>/dev/null | awk -F: '$2=="vpn" && $1 ~ /^[a-z0-9]+-[a-z0-9]+$/{print $1}' | sort |
+            while read -r n; do [[ -f "$CONF_DIR/$n.ovpn" ]] && echo "$n"; done)
+  fi
+  [[ -n "$_cons" ]] && printf '%s\n' "$_cons"
+  return 0
+}
+# Ours only: a foreign NetworkManager VPN (work-vpn) is neither shown as connected nor touched by on/off.
+active()      { nmcli -t -f NAME,TYPE,STATE con show --active 2>/dev/null | awk -F: '$2=="vpn" && $3=="activated"{print $1}' | grep -xF -f <(connections) 2>/dev/null | head -1 || true; }
+# OpenVPN restarting on its own (server not answering, ping-restart): NetworkManager keeps the profile "activated"
+# and persist-tun keeps the routes, so nothing flows and nothing complains. The journal is the only witness:
+# a restart line after the last "Initialization Sequence Completed" within the last three minutes. ~20 ms.
+# Also stalled: the uplink has lost its link. NetworkManager keeps the Wi-Fi "activated" for its 15 s link
+# timeout and the persistent tunnel keeps tun0, so nothing else would tell for a quarter of a minute
+# (09.09. 21:37, hotspot switched off: the panel said "connected" until NM gave up). The kernel knows at once.
+stalled() {
+  local up; up=$(uplink)
+  [[ -n "$up" ]] || return 0                                              # a tunnel with no uplink at all
+  [[ "$(cat "/sys/class/net/$up/carrier" 2>/dev/null)" == 1 ]] || return 0   # no carrier: associated with nothing
+  journalctl -t nm-openvpn -o cat --since -180s -n 30 2>/dev/null | awk '
+    /Initialization Sequence Completed/ { s=0 }
+    /process restarting|poll timeout|Inactivity timeout|Network is unreachable/ { s=1 }
+    END { exit !s }'
+}
+live()        { nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="vpn"{print $1}' | grep -xF -f <(connections) 2>/dev/null || true; }   # ours, activated or activating
+default_con() {   # the file, else the first managed profile (install.sh and add write the file when it is missing)
+  local d; d=$(user_setting default)
+  if [[ -n "$d" ]] && connections | grep -qx "$d"; then echo "$d"; else connections | head -1; fi
+}
+# "de" -> proton-de (provider of the default), otherwise the only connection ending in -de; a full name always works
+resolve() {
+  local q=${1,,} d m
+  connections | grep -qx "$q" && { echo "$q"; return; }
+  d=$(default_con); [[ -n "$d" ]] && connections | grep -qx "${d%-*}-$q" && { echo "${d%-*}-$q"; return; }
+  m=$(connections | grep -- "-$q\$" || true)
+  [[ $(wc -l <<<"$m") -eq 1 && -n "$m" ]] && { echo "$m"; return; }
+  return 1
+}
+country_name() {
+  case "${1^^}" in
+    CH) echo "Switzerland" ;;  DE) echo "Germany" ;;       AT) echo "Austria" ;;      FR) echo "France" ;;
+    IT) echo "Italy" ;;        NL) echo "Netherlands" ;;   BE) echo "Belgium" ;;      LU) echo "Luxembourg" ;;
+    GB|UK) echo "United Kingdom" ;; IE) echo "Ireland" ;;  ES) echo "Spain" ;;        PT) echo "Portugal" ;;
+    SE) echo "Sweden" ;;       NO) echo "Norway" ;;        DK) echo "Denmark" ;;      FI) echo "Finland" ;;
+    IS) echo "Iceland" ;;      PL) echo "Poland" ;;        CZ) echo "Czechia" ;;      US) echo "USA" ;;
+    CA) echo "Canada" ;;       JP) echo "Japan" ;;         SG) echo "Singapore" ;;    AU) echo "Australia" ;;
+    AR) echo "Argentina" ;;    BR) echo "Brazil" ;;        MX) echo "Mexico" ;;       CL) echo "Chile" ;;
+    *)  echo "${1^^}" ;;
+  esac
+}
+# proton-ch -> "Proton · Switzerland"
+label() {
+  local p=${1%-*} c=${1##*-}
+  case "$p" in proton) p="Proton" ;; mullvad) p="Mullvad" ;; *) p="${p^}" ;; esac
+  [[ "$c" == "$1" ]] && { echo "$1"; return; }
+  echo "$p · $(country_name "$c")"
+}
+
+# ---- trusted networks, auto-connect, recent ---------------------------------------------------------
+user_setting()     { grep -s "^$1=" "$SETTINGS_FILE" | tail -1 | cut -d= -f2-; }   # empty = off
+current_ssid() {
+  # --rescan no: read NetworkManager's cached scan list; a 5-second poll must never trigger a Wi-Fi scan.
+  # -t escapes ":" inside the SSID as "\:", undone below.
+  nmcli -t -f ACTIVE,SSID dev wifi list --rescan no 2>/dev/null | awk '/^yes:/{sub(/^yes:/,""); print; exit}' | sed 's/\\:/:/g'
+}
+is_trusted() { [[ -n "${1:-}" && "$1" != *$'\n'* ]] && grep -qxF -- "$1" "$TRUSTED_FILE" 2>/dev/null; }   # a multi-line SSID would match any trusted line (grep -F reads it as a list)
+known_wifi() {
+  # SSIDs of the saved Wi-Fi profiles, most recently used first (NetworkManager's connection timestamp), the one
+  # we are on at the top, each once. One nmcli call per profile is fine: this only runs for `vpn json`, and a
+  # laptop knows a few dozen networks at most. The widget shows the trusted ones plus the last few used and
+  # hides the rest behind "show all", so the order here is the order that matters.
+  local cur n s; cur=$(current_ssid)
+  { [[ -n "$cur" ]] && echo "$cur"
+    nmcli -t -f NAME,TYPE,TIMESTAMP con show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $3 ":" $1}' | sort -t: -k1,1nr | cut -d: -f2- | while read -r n; do
+      s=$(nmcli -t -f 802-11-wireless.ssid con show "$n" 2>/dev/null | cut -d: -f2- | sed 's/\\:/:/g'); echo "${s:-$n}"; done
+    cat "$TRUSTED_FILE" 2>/dev/null || true   # a missing file must not fail the pipeline (pipefail)
+  } | awk 'NF && !seen[$0]++'
+}
+# The user just connected or disconnected by hand: remember on which network, so `auto` leaves them alone
+# for as long as they stay on it. Skipped when the action came from `auto` itself.
+auto() {
+  # Called by every bar poll (`json`, and `indicator` for a command module). The trusted-network policy itself
+  # runs as root, in the dispatcher, at pre-up - before the first packet and before login. This only turns its
+  # last automatic decision into a toast, once. Until 9 September the decision was made here, on the poll,
+  # which left up to 5 s plus the handshake open on every untrusted network; see README, "Why the kill switch".
+  local ts kind ssid name
+  [[ -r "$EVENT_FILE" ]] || return 0
+  IFS=$'\t' read -r ts kind ssid name < "$EVENT_FILE" || true
+  [[ -n "$ts" ]] || return 0
+  if [[ "${1:-}" == "--dry-run" ]]; then echo "last decision: $kind on \"$ssid\"${name:+ ($name)}"; return 0; fi
+  [[ "$ts" != "$(cat "$AUTO_STATE" 2>/dev/null)" ]] || return 0
+  echo "$ts" > "$AUTO_STATE" 2>/dev/null || true
+  case "$kind" in
+    connect)    notify "VPN auto-connect" "Untrusted Wi-Fi \"$ssid\": network shut, $( [[ -n "$(active)" ]] && echo connected || echo connecting) $(label "$name") ($name). Click to trust this network." --exec "$SELF" trust add "$ssid" ;;
+    disconnect) notify "VPN disconnected" "Trusted Wi-Fi \"$ssid\" - kill switch released" ;;
+    noprofile)  notify -u critical "VPN: auto-connect has nothing to connect" "Untrusted Wi-Fi \"$ssid\", but no profile is set up - the network is left OPEN. Add a profile, or turn auto-connect off." ;;
+  esac
+}
+trust() {
+  # vpn trust                     current network, the trusted list, the two auto settings
+  # vpn trust add|remove [SSID]   default: the network we are on
+  # vpn trust toggle [SSID]       the menu row
+  local op=${1:-} ssid=${2:-}
+  [[ -n "$ssid" ]] || ssid=$(current_ssid)
+  case "$op" in
+    ""|list)
+      printf 'Wi-Fi:       %s\n' "${ssid:-(not on Wi-Fi)}"
+      [[ -n "$ssid" ]] && { is_trusted "$ssid" && echo "             trusted" || echo "             untrusted"; }
+      echo "Trusted:     $( [[ -s "$TRUSTED_FILE" ]] && paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g' || echo '(none)')"
+      echo "Auto-connect on untrusted Wi-Fi:  $(v=$(user_setting autoconnect); echo "${v:-off}")"
+      echo "Auto-disconnect on trusted Wi-Fi: $(v=$(user_setting autodisconnect); echo "${v:-off}")" ;;
+    add)
+      [[ -n "$ssid" ]] || { echo "Not on Wi-Fi and no SSID given." >&2; exit 1; }
+      is_trusted "$ssid" || ks trust add "$ssid" || { echo "Could not write the trusted list (sudo -n $KS trust add - sudoers?)" >&2; exit 1; }
+      menu_write >/dev/null; notify "VPN" "\"$ssid\" is now a trusted network" ;;
+    remove)
+      [[ -n "$ssid" ]] || { echo "Not on Wi-Fi and no SSID given." >&2; exit 1; }
+      ks trust remove "$ssid" || { echo "Could not write the trusted list (sudo -n $KS trust remove - sudoers?)" >&2; exit 1; }
+      menu_write >/dev/null; notify "VPN" "\"$ssid\" is no longer trusted" ;;
+    toggle)
+      if is_trusted "$ssid"; then trust remove "$ssid"; else trust add "$ssid"; fi ;;
+    edit)
+      # The whole list at once, for people with a hundred saved networks. fzf, because its keys can be chosen:
+      # space or tab marks, enter saves, typing searches, ctrl-c leaves everything as it is. (gum filter keeps
+      # its search box focused, so space typed a space and emptied the list - the wrong thing to happen on the
+      # key everyone reaches for.) Every trusted name is in the offered set (known_wifi unions the file), so
+      # what comes back is the new list. Trusted rows start marked: fzf has no preselect flag, so the load
+      # event walks to each of them and toggles.
+      [[ -t 0 && -t 1 ]] || present trust edit
+      local sel cur count list pre i n
+      cur=$(current_ssid); list=$(known_wifi)
+      pre=""; i=0
+      while IFS= read -r n; do i=$((i+1)); is_trusted "$n" && pre+="+pos($i)+toggle"; done <<< "$list"
+      gum style --bold "Trusted Wi-Fi networks"
+      gum style --faint "space or tab marks a network as trusted · enter saves · type to search · ctrl-c leaves everything as it is${cur:+ · you are on \"$cur\"}"
+      sel=$(printf '%s\n' "$list" | fzf --multi --layout=reverse --height=~18 --info=hidden --no-sort \
+              --prompt='  ' --pointer='›' --marker='◉' --bind 'space:toggle,tab:toggle' --bind "load:${pre#+}${pre:++first}") || { echo "Unchanged."; exit 0; }
+      printf '%s\n' "$sel" | ks trust set || { echo "Could not write the trusted list (sudo -n $KS trust set - sudoers?)" >&2; exit 1; }
+      count=$(grep -c . "$TRUSTED_FILE" || true)
+      menu_write >/dev/null; notify "VPN" "$count trusted network$( [[ $count == 1 ]] || echo s)"
+      echo "Trusted now: $(paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g')" ;;
+    *) echo "vpn trust [add|remove|toggle|edit] [SSID]" >&2; exit 2 ;;
+  esac
+}
+recent_add() {   # newest first, no duplicates, at most 5; returns 1 when the order did not change
+  local before; before=$(cat "$RECENT_FILE" 2>/dev/null || true)
+  mkdir -p "$CFG_DIR"
+  { echo "$1"; grep -vxF -- "$1" "$RECENT_FILE" 2>/dev/null || true; } | grep -v '^$' | head -5 > "$RECENT_FILE.tmp" && mv "$RECENT_FILE.tmp" "$RECENT_FILE"
+  [[ "$(cat "$RECENT_FILE")" != "$before" ]]
+}
+recent() {   # only names that still exist
+  [[ -f "$RECENT_FILE" ]] || return 0
+  while read -r n; do [[ -n "$n" ]] && connections | grep -qx "$n" && echo "$n"; done < "$RECENT_FILE"
+  return 0
+}
+jesc() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '%s' "$s"; }   # JSON string escaping for the menu block
+
+# ---- one JSON blob for the bar widget ------------------------------------------------------------
+json_state() {
+  # Everything the QML widget shows, in one call per poll. Cheap: the nmcli snapshots are memoised above,
+  # the rest is file reads. Byte counters come along so the widget can draw throughput without a second call.
+  local cur pending wd kss def ssid state want iface rx tx rec first n
+  cur=$(active); pending=$(live | head -1); kss=$(ks_state); def=$(default_con); ssid=$(current_ssid)
+  systemctl is-active -q vpn-reconnect.service 2>/dev/null && wd=true || wd=false
+  if [[ -n "$cur" ]] && stalled; then state=stalled; want=$cur
+  elif [[ -n "$cur" ]]; then state=connected; want=$cur
+  elif [[ "$wd" == true ]]; then state=down; want=$(cat "$MARK" 2>/dev/null || true)   # the watchdog is retrying: red, also during its attempts (as `indicator` does)
+  elif [[ -n "$pending" || -e "$MARK" ]]; then state=connecting; want=${pending:-$(cat "$MARK" 2>/dev/null)}
+  else state=off; want=""; fi
+  iface=""; rx=0; tx=0
+  if [[ -n "$cur" ]]; then   # counters also while stalled - a flat sparkline is part of the picture
+    # NetworkManager lists the parent device (the Wi-Fi card) for a VPN connection; the tunnel's own counters live
+    # on the tun interface that carries the connection's address. Fall back to the first tun*, then to NM's answer.
+    local addr; addr=$(nmcli -g IP4.ADDRESS con show "$cur" 2>/dev/null | head -1); addr=${addr%%/*}
+    iface=$([[ -n "$addr" ]] && ip -4 -o addr show 2>/dev/null | awk -v a="$addr/" 'index($4, a)==1 {print $2; exit}')
+    [[ -n "$iface" ]] || for t in /sys/class/net/tun*; do [[ -e "$t" ]] && { iface=${t##*/}; break; }; done
+    [[ -n "$iface" ]] || iface=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: -v n="$cur" '$1==n{print $2; exit}')
+    [[ -n "$iface" && -r /sys/class/net/$iface/statistics/rx_bytes ]] && { rx=$(<"/sys/class/net/$iface/statistics/rx_bytes"); tx=$(<"/sys/class/net/$iface/statistics/tx_bytes"); }
+  fi
+  rec=$(recent)
+  printf '{"state":"%s","active":"%s","want":"%s","label":"%s","killswitch":"%s","watchdog":%s,"default":"%s",' \
+    "$state" "$cur" "$want" "$(jesc "$(label "${want:-$def}")")" "$kss" "$wd" "$def"
+  printf '"ssid":"%s","manual":%s,"trusted":%s,"autoconnect":%s,"autodisconnect":%s,' \
+    "$(jesc "$ssid")" "$( [[ -n "$ssid" && "$(cat /run/vpn-killswitch.manual 2>/dev/null)" == "$ssid" ]] && echo true || echo false)" "$( [[ -n "$ssid" ]] && is_trusted "$ssid" && echo true || echo false)" \
+    "$( [[ "$(user_setting autoconnect)" == on ]] && echo true || echo false)" "$( [[ "$(user_setting autodisconnect)" == on ]] && echo true || echo false)"
+  printf '"iface":"%s","rx":%s,"tx":%s,"now":%s,' "$iface" "$rx" "$tx" "$(date +%s)"
+  printf '"trustedList":['; first=1
+  while read -r n; do [[ -n "$n" ]] || continue; (( first )) || printf ','; first=0; printf '"%s"' "$(jesc "$n")"; done < <(cat "$TRUSTED_FILE" 2>/dev/null || true)
+  # every Wi-Fi NetworkManager knows (saved profiles), so the panel can trust one you are not on right now
+  printf '],"knownWifi":['; first=1
+  while read -r n; do [[ -n "$n" ]] || continue; (( first )) || printf ','; first=0; printf '"%s"' "$(jesc "$n")"; done < <(known_wifi)
+  printf '],"profiles":['; first=1
+  while read -r n; do
+    [[ -n "$n" ]] || continue; (( first )) || printf ','; first=0
+    printf '{"name":"%s","label":"%s","provider":"%s","country":"%s","active":%s,"default":%s,"recent":%s}' \
+      "$n" "$(jesc "$(label "$n")")" "${n%%-*}" "${n##*-}" \
+      "$( [[ "$n" == "$cur" ]] && echo true || echo false)" "$( [[ "$n" == "$def" ]] && echo true || echo false)" \
+      "$( grep -qx -- "$n" <<<"$rec" && echo true || echo false)"
+  done < <({ echo "$def"; echo "$rec"; connections; } | awk 'NF && !seen[$0]++')
+  printf ']}\n'
+}
+public_ip() {
+  # Where does the traffic really come out? Slow (a round trip to ipinfo.io), so the widget asks only when
+  # the panel opens or the state changes. Empty fields when offline or blocked - never an error.
+  local info
+  info=$(curl -4 -s --max-time 5 https://ipinfo.io/json 2>/dev/null || true)
+  jq -c '{ip: (.ip // ""), country: (.country // ""), city: (.city // ""), org: ((.org // "") | sub("^AS[0-9]+ "; ""))}' <<<"$info" 2>/dev/null || echo '{"ip":"","country":"","city":"","org":""}'
+}
+
+status() {
+  local kss cur def
+  kss=$(ks_state); cur=$(active); def=$(default_con)
+  if [[ -n "$cur" ]]; then
+    if stalled; then printf 'VPN:         STALLED - %s (%s): the uplink lost its link or the server is not answering; OpenVPN is restarting. Nothing flows until it is back.\n' "$(label "$cur")" "$cur"
+    else printf 'VPN:         connected, %s (%s)\n' "$(label "$cur")" "$cur"; fi
+  else                     printf 'VPN:         disconnected (default: %s)\n' "${def:-none}"; fi
+  if [[ "$kss" == on ]] && ! ks status >/dev/null 2>&1; then kss="state file says shut, but root disagrees or the table is gone - sudo -n $KS status reloads it"; fi
+  case "$kss" in
+    on)       printf 'Kill switch: on - uplink shut, only the tunnel may carry traffic\n' ;;
+    off)      printf 'Kill switch: off - uplink open, table loaded\n' ;;
+    unloaded) printf 'Kill switch: NOT LOADED - nothing is blocked%s (no profile yet? unit stopped? sudo systemctl start vpn-killswitch)\n' "$( [[ -e "$MARK" ]] && echo ", although a VPN is wanted")" ;;
+    *)        printf 'Kill switch: %s\n' "$kss" ;;
+  esac
+  local ssid; ssid=$(current_ssid)
+  if [[ -n "$ssid" ]]; then
+    printf 'Wi-Fi:       %s (%s)' "$ssid" "$(is_trusted "$ssid" && echo trusted || echo untrusted)"
+    [[ "$(user_setting autoconnect)" == "on" ]] && printf ' · auto-connect on'
+    [[ "$(user_setting autodisconnect)" == "on" ]] && printf ' · auto-disconnect on'
+    echo
+  fi
+  systemctl is-active -q vpn-reconnect.service 2>/dev/null && printf 'Watchdog:    running, wants %s\n' "$(cat "$MARK" 2>/dev/null)"
+  if [[ -n "$ssid" && "$(cat /run/vpn-killswitch.manual 2>/dev/null)" == "$ssid" ]]; then printf 'Manual:      you switched the VPN by hand on this network - auto-connect/-disconnect pause here until you change network (a trust or automation change lifts this)\n'; fi
+  if [[ "${1:-}" == "--ip" ]]; then
+    # Cross-check from outside: where does the traffic really exit? (ipinfo.io, ~1000 requests/day without a key)
+    local info ip country city org
+    info=$(curl -4 -s --max-time 5 https://ipinfo.io/json 2>/dev/null || true)
+    IFS=$'\t' read -r ip country city org < <(jq -r '[.ip // "", .country // "", .city // "", .org // ""] | @tsv' <<<"$info" 2>/dev/null || true)
+    if [[ -n "${ip:-}" ]]; then
+      printf 'Public IP:   %s\n' "$ip"
+      printf 'Seen as:     %s (%s)%s%s\n' "$(country_name "$country")" "$country" "${city:+, $city}" "${org:+ · ${org#AS[0-9]* }}"
+      if [[ -n "$cur" && "${country,,}" != "${cur##*-}" ]]; then
+        echo "!! Expected ${cur##*-}, seen ${country,,} - traffic is NOT going through the tunnel (or ipinfo maps the IP differently)"
+      fi
+    else
+      printf 'Public IP:   unreachable\n'
+    fi
+  fi
+  [[ "$kss" == "disabled" && -e "$MARK" ]] && echo "-> Kill switch is disabled: traffic bypasses the tunnel while it is down (vpn killswitch on)"
+  if [[ -z "$cur" && "$kss" == "on" ]]; then
+    if systemctl is-active -q vpn-reconnect.service 2>/dev/null; then echo "-> Kill switch is blocking. The watchdog reconnects as soon as it can; \`vpn off\` releases the network."
+    else echo "-> Kill switch is blocking and nothing is trying to connect. \`vpn on\` starts a tunnel, \`vpn off\` releases the network."; fi
+  fi
+}
+
+connect() {
+  local name cur n want
+  if [[ -n "${1:-}" ]]; then
+    name=$(resolve "$1") || die_unknown "$1"
+  else
+    name=$(cat "$MARK" 2>/dev/null || true)          # a pending reconnect target wins over the default
+    connections | grep -qx "${name:-/}" || name=$(default_con)
+    [[ -n "$name" ]] || { echo "No VPN profile yet - run: vpn add" >&2; exit 1; }
+  fi
+  cur=$(active)
+  if [[ "$cur" == "$name" ]]; then echo "Already connected: $name"; status --ip; return 0; fi
+  # `arm` writes the marker and shuts the uplink at once - before the handshake, not after it. The handshake is
+  # allowed by IP (the endpoints set), so nothing else leaves the machine while the tunnel is negotiated; the
+  # watchdog has connected through a shut uplink on every reconnect since 8 September. Arming never opens
+  # anything, so switching away from a running tunnel stays leak-free. What must not happen is a second attempt
+  # while the first is still negotiating (08.09. 14:26: two racing connects, 33 s dark) - see "Superseded" below.
+  ks arm "$name" \
+    || { echo "Could not arm the kill switch (sudoers? /etc/vpn/killswitch.nft? -> sudo ./install.sh)" >&2; exit 1; }
+  # Switching: bring the old profile(s) down first - activated or still activating; the kill switch stays up meanwhile.
+  # Then stop the watchdog: the old profile's vpn-down starts one (marker present), and a watchdog racing our own
+  # `nmcli con up` was the 08.09. blackout; stopping it before the down would only let vpn-down start a fresh one.
+  for n in $(live); do [[ "$n" == "$name" ]] || nmcli con down "$n" >/dev/null 2>&1 || true; done
+  ks unwatch
+  if nmcli con up "$name"; then
+    recent_add "$name" && menu_write >/dev/null   # recently used profiles move up in the menu
+    if ks on "$name"; then   # belt and braces; normally already done by the dispatcher
+      notify "VPN connected" "$(label "$name") ($name), kill switch $(ks_state)"
+    else
+      notify -u critical "VPN connected WITHOUT kill switch" "rules could not be loaded - see: sudo -n $KS on $name" --exec "$SELF" off
+    fi
+    status --ip
+  else
+    # Another `vpn on` may have taken over while we were negotiating (second click, menu). The marker then names
+    # its target, not ours: do not overwrite it and do not start a watchdog chasing a profile nobody asked for.
+    want=$(cat "$MARK" 2>/dev/null || true)
+    if [[ "$want" != "$name" ]]; then
+      if [[ -z "$want" ]]; then echo "Cancelled: $name is no longer wanted." >&2
+      else                     echo "Superseded: $want is being connected instead of $name." >&2; fi
+      exit 1
+    fi
+    ks on "$name" || echo "warning: kill switch rules could not be loaded" >&2
+    ks watch   # keep trying
+    notify -u critical "VPN: connection failed" "Kill switch $(ks_state), watchdog keeps retrying. Click here to release the network." --exec "$SELF" off
+    echo "Connection failed. The kill switch is on, nothing leaves the machine; the watchdog retries every 10 s." >&2
+    echo "Release the network: vpn off" >&2
+    exit 1
+  fi
+}
+
+disconnect() {
+  local n ok=1
+  ks off || ok=0   # first: without the marker the dispatcher knows this disconnect is intended; also opens the uplink
+  for n in $(live); do nmcli con down "$n" >/dev/null 2>&1 || true; done   # activated AND activating ones
+  if (( ok )); then
+    notify "VPN disconnected" "Network released - open until you change network"
+  else notify -u critical "VPN: could not remove the kill switch" "sudo -n $KS off failed - check /etc/sudoers.d/vpn"; fi
+  status
+  (( ok ))
+}
+
+indicator() {
+  # Waybar-style JSON for the Omarchy bar command module (polled every 5 s).
+  # A command module knows only two colours: "inactive" = bar foreground, "active" = the theme's
+  # urgent colour (Ui/WidgetButton.qml: activeColor = bar.urgent = theme red). Red is therefore
+  # reserved for "something is wrong" - no tunnel and nobody about to fix it. Connected is the
+  # normal state and keeps the foreground colour; the filled shield plus the profile name say so.
+  auto   # the toast for the dispatcher's last decision rides on this poll; returns at once when there is none
+  local kss cur pending want wd
+  kss=$(ks_state); cur=$(active)
+  systemctl is-active -q vpn-reconnect.service 2>/dev/null && wd=1 || wd=""
+  pending=$(live | head -1)
+  if [[ -n "$cur" ]] && stalled; then
+    printf '{"text":"\U000F099E %s","tooltip":"Tunnel stalled - OpenVPN is restarting, %s is not answering. Nothing flows until it is back.\\nClick: disconnect · Right-click: menu","class":"active"}\n' "$cur" "$cur"
+  elif [[ -n "$cur" ]]; then
+    printf '{"text":"\U000F099D %s","tooltip":"%s (%s), kill switch %s\\nClick: disconnect · Right-click: menu","class":"inactive"}\n' "$cur" "$(label "$cur")" "$cur" "$kss"
+  elif [[ -n "$wd" ]]; then
+    # The watchdog only runs after NetworkManager gave up: this is the alarm state. It is checked
+    # before "connecting", or every retry of the watchdog would blink the alarm away for one poll.
+    if [[ "$kss" == "disabled" ]]; then
+      printf '{"text":"\U000F099E","tooltip":"VPN down, kill switch DISABLED - traffic bypasses the tunnel, watchdog is reconnecting\\nClick: reconnect · Right-click: menu","class":"active"}\n'
+    else
+      printf '{"text":"\U000F099E","tooltip":"VPN down, kill switch is blocking, watchdog is reconnecting\\nClick: reconnect · Right-click: menu / release","class":"active"}\n'
+    fi
+  elif [[ -n "$pending" || -e "$MARK" ]]; then
+    # Connecting: nmcli is negotiating, or "vpn on" has armed the marker and has not reached nmcli
+    # yet. The user asked for this a moment ago - it is not an alarm, so it is not the urgent colour.
+    # Outline shield (not protected yet) plus the name and an ellipsis, so it reads as in progress.
+    want=${pending:-$(cat "$MARK" 2>/dev/null)}
+    printf '{"text":"\U000F0484 %s…","tooltip":"Connecting to %s (%s), kill switch armed\\nClick: cancel · Right-click: menu","class":"inactive"}\n' "$want" "$(label "$want")" "$want"
+  else
+    printf '{"text":"\U000F0484","tooltip":"VPN off (default: %s)\\nClick: connect · Right-click: menu","class":"inactive"}\n' "$(default_con)"
+  fi
+}
+
+guess_name() {
+  # from the file name: ch.protonvpn.udp.ovpn -> proton-ch, mullvad_ch_all.conf -> mullvad-ch
+  local b prov="" cc="" t
+  b=$(basename "${1,,}"); b=${b%.*}
+  for t in ${b//[._-]/ }; do
+    case "$t" in *proton*) prov=proton ;; *mullvad*) prov=mullvad ;; *nord*) prov=nord ;; esac
+    [[ -z "$cc" && "$t" =~ ^[a-z]{2}$ ]] && cc=$t
+  done
+  echo "${prov:-vpn}-${cc:-xx}"
+}
+
+add() {
+  # Wizard in a terminal (gum, like Omarchy's own installers). From the menu we open a floating terminal for it.
+  # Every check the user can fix loops back instead of exiting: in the floating terminal the next keypress takes
+  # the error message and the whole wizard with it, and everything typed so far would have to be typed again.
+  local f=${1:-}
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    present add ${f:+"$f"}
+  fi
+  local src tmp name guess prov u p
+  gum style --bold "Add a VPN profile"
+  while :; do                                  # config: pick a source, then check it really is one
+    if [[ -z "$f" ]]; then
+      src=$(gum choose --header "Where is the OpenVPN config?" "A file in ~/Downloads or ~" "Paste from the clipboard" "Type a path") || { echo "Cancelled."; exit 1; }
+      case "$src" in
+        "A file"*)
+          # ~ with depth 2 already covers ~/Downloads; newest first, each file once
+          f=$(find "$HOME" -maxdepth 2 -not -path '*/.*' -type f \( -iname '*.ovpn' -o -iname '*.conf' \) -printf '%T@\t%p\n' 2>/dev/null \
+              | sort -rn | cut -f2- | awk '!seen[$0]++' | head -40 | gum choose --header "Pick the config" --height 15) || continue
+          ;;
+        "Paste"*)
+          tmp=$(mktemp --suffix=.ovpn)
+          wl-paste --type text/plain --no-newline > "$tmp" 2>"$tmp.err" || true   # wl-paste infers a MIME type from the .ovpn suffix otherwise
+          if ! grep -q '^remote ' "$tmp"; then
+            err "The clipboard does not hold an OpenVPN config (no 'remote' line)."
+            err "Got $(wc -c <"$tmp") bytes$( [[ -s "$tmp.err" ]] && echo ", wl-paste said: $(head -c 120 "$tmp.err")" ): $(head -c 80 "$tmp" | tr '\n' ' ')"
+            rm -f "$tmp" "$tmp.err"; tmp=""; continue
+          fi
+          rm -f "$tmp.err"
+          f=$tmp; echo "Config taken from the clipboard ($(grep -c '^remote ' "$f") remote lines)."
+          ;;
+        *)
+          f=$(gum input --header "Path to the .ovpn / .conf" --placeholder "~/Downloads/de.protonvpn.udp.ovpn") || continue
+          f=${f/#\~/$HOME}
+          ;;
+      esac
+    fi
+    [[ -f "$f" ]] || { err "File not found: $f"; f=""; continue; }
+    grep -q '^remote ' "$f" || { err "Not an OpenVPN config (no 'remote' line): $f"; f=""; continue; }
+    break
+  done
+  guess=$(guess_name "$f")
+  while :; do                                  # name: ask again on a typo or a collision, pre-filled with what was typed
+    name=$(gum input --header "Profile name as provider-country (Enter keeps the suggestion)" --value "$guess" --placeholder "proton-ch") || { echo "Cancelled."; exit 1; }
+    name=${name,,}; name=${name// /-}; guess=$name
+    [[ "$name" =~ ^[a-z0-9]+-[a-z0-9]+$ ]] || { err "Name must be provider-country: exactly one dash, letters and digits only - proton-ch, mullvad-se. Got: ${name:-<empty>}"; continue; }
+    nmcli -t -f NAME con show 2>/dev/null | grep -qxF "$name" && { err "A connection named '$name' already exists. Choose another name, or remove that one first: vpn remove $name"; continue; }
+    break
+  done
+  prov=${name%%-*}
+  if ! ks has-auth "$prov"; then
+    gum style --faint "No credentials for '$prov' yet. Proton: OpenVPN/IKEv2 username from account.protonvpn.com (not the account password). Mullvad: account number, password m."
+    while :; do                                # credentials: an empty field is a slip, not a reason to start over
+      u=$(gum input --header "Username for $prov" --value "${u:-}") || { echo "Cancelled."; exit 1; }
+      p=$(gum input --header "Password for $prov" --password) || { echo "Cancelled."; exit 1; }
+      [[ -n "$u" && -n "$p" ]] && break
+      err "Username and password are both required. Esc cancels the wizard."
+    done
+  else
+    gum style --faint "Credentials for '$prov' are already stored."
+  fi
+  gum confirm "Add '$name' ($(label "$name")) from $(basename "$f")?" || { echo "Cancelled."; exit 1; }
+  if out=$(printf '%s\n%s\n' "${u:-}" "${p:-}" | ks add "$name" "$f" 2>&1); then
+    unset _cons
+    # the first profile becomes the default - vpn-root add does that
+    menu_write >/dev/null
+    [[ -n "${tmp:-}" ]] && rm -f "$tmp"
+    notify "VPN added" "$(label "$name") ($name)"; echo "$out"; echo; gum style --bold "Done: vpn on $name"
+  else
+    [[ -n "${tmp:-}" ]] && rm -f "$tmp"
+    notify -u critical "VPN: adding failed" "$out"; err "$out"; exit 1
+  fi
+}
+
+remove() {
+  local name=${1:-}
+  if [[ -z "$name" ]]; then
+    [[ -t 0 && -t 1 ]] || present remove
+    name=$(connections | gum choose --header "Remove which profile?") || { echo "Cancelled."; exit 1; }
+    gum confirm "Remove '$name' and its config?" || { echo "Cancelled."; exit 1; }
+  fi
+  local q=$name
+  name=$(resolve "$q") || { [[ -e "$CONF_DIR/$q.ovpn" ]] && name=$q; } || die_unknown "$q"   # orphan config (failed add) is removable too
+  if [[ "$(active)" == "$name" || "$(cat "$MARK" 2>/dev/null)" == "$name" ]]; then disconnect >/dev/null; fi   # also a pending watchdog target
+  ks remove "$name" || { notify -u critical "VPN: remove failed" "$name"; exit 1; }
+  unset _cons
+  menu_write >/dev/null; notify "VPN removed" "$name"
+}
+
+menu_write() {
+  # Replace the block between the markers in the menu extension (JSONC, hence text replacement instead of json.load).
+  # Opt-in since the panel took over: the block is only refreshed where it already exists (every action calls
+  # this), and only `vpn menu-write` creates it. Otherwise the installer's removal would be undone by the
+  # next `vpn on`.
+  local def block n name desc i ssid rec
+  [[ "${1:-}" == "--create" ]] || grep -qs -- "// >>> vpn" "$MENU_FILE" || return 0
+  def=$(default_con); rec=$(recent)   # read once: `recent | grep -q` would trip pipefail on grep's early exit
+  block="  // >>> vpn (generated by \`vpn menu-write\`, do not edit by hand)"$'\n'
+  block+="  \"vpn\": {\"icon\":\"󰦝\",\"label\":\"VPN\",\"aliases\":[\"vpn\"]},"$'\n'
+  block+="  \"vpn.off\": {\"icon\":\"󰦞\",\"label\":\"Disconnect, release network\",\"when\":\"$SELF is-wanted\",\"action\":\"$SELF off\"},"$'\n'
+  while read -r n; do
+    [[ -n "$n" ]] || continue
+    name=$(label "$n"); [[ "$n" == "$def" ]] && name="$name (default)"
+    desc=$n; [[ "$n" != "$def" ]] && grep -qx -- "$n" <<<"$rec" && desc="$n · recent"
+    block+="  \"vpn.$n\": {\"icon\":\"󰦝\",\"label\":\"$name\",\"description\":\"$desc\",\"checked\":\"$SELF is-active $n\",\"action\":\"$SELF on $n\"},"$'\n'
+  done < <({ echo "$def"; recent; connections; } | awk 'NF && !seen[$0]++')   # default, then recently used, then the rest
+  # everything that is not a profile lives in one submenu, so the top level stays the VPN list
+  block+="  \"vpn.settings\": {\"icon\":\"\",\"label\":\"Settings\",\"description\":\"status, kill switch, default, add / remove\"},"$'\n'
+  block+="  \"vpn.settings.status\": {\"icon\":\"󰋼\",\"label\":\"Status\",\"action\":\"$SELF present status\"},"$'\n'
+  block+="  \"vpn.settings.killswitch\": {\"icon\":\"󰒃\",\"label\":\"Kill switch\",\"description\":\"block all traffic outside the tunnel while a VPN is wanted\",\"checked\":\"$SELF is-killswitch\",\"action\":\"$SELF killswitch toggle\"},"$'\n'
+  block+="  \"vpn.settings.default\": {\"icon\":\"󰓎\",\"label\":\"Default\"},"$'\n'
+  while read -r n; do
+    [[ -n "$n" ]] || continue
+    block+="  \"vpn.settings.default.$n\": {\"icon\":\"󰓎\",\"label\":\"$(label "$n")\",\"checked\":\"$SELF is-default $n\",\"action\":\"$SELF default $n\"},"$'\n'
+  done < <(connections)
+  # Trusted networks: the "this network" row is evaluated live (checked/action without an SSID = the one we are on),
+  # so it stays right while roaming; the list below is static and rewritten by `trust add/remove`.
+  block+="  \"vpn.settings.trust\": {\"icon\":\"󰖩\",\"label\":\"Trusted networks\",\"description\":\"auto-connect on unknown Wi-Fi, auto-disconnect on yours\"},"$'\n'
+  block+="  \"vpn.settings.trust.here\": {\"icon\":\"󰖩\",\"label\":\"Trust this network\",\"description\":\"the Wi-Fi you are on right now\",\"when\":\"[ -n \\\"\$($SELF ssid)\\\" ]\",\"checked\":\"$SELF is-trusted\",\"action\":\"$SELF trust toggle\"},"$'\n'
+  block+="  \"vpn.settings.trust.autoconnect\": {\"icon\":\"󰒃\",\"label\":\"Auto-connect on untrusted Wi-Fi\",\"description\":\"shut the network and bring up the default profile the moment you join\",\"checked\":\"$SELF is-autoconnect\",\"action\":\"$SELF autoconnect toggle\"},"$'\n'
+  block+="  \"vpn.settings.trust.autodisconnect\": {\"icon\":\"󰦞\",\"label\":\"Auto-disconnect on trusted Wi-Fi\",\"description\":\"drop the tunnel and the kill switch at home\",\"checked\":\"$SELF is-autodisconnect\",\"action\":\"$SELF autodisconnect toggle\"},"$'\n'
+  i=0
+  while read -r ssid; do
+    [[ -n "$ssid" ]] || continue; i=$((i+1))
+    block+="  \"vpn.settings.trust.$i\": {\"icon\":\"󰖩\",\"label\":\"$(jesc "$ssid")\",\"description\":\"trusted · click to forget\",\"action\":\"$SELF trust remove $(jesc "$(printf '%q' "$ssid")")\"},"$'\n'
+  done < <(cat "$TRUSTED_FILE" 2>/dev/null || true)
+  block+="  \"vpn.settings.add\": {\"icon\":\"󰐕\",\"label\":\"Add VPN…\",\"description\":\"file, clipboard or path · name · credentials\",\"action\":\"$SELF add\"},"$'\n'
+  block+="  \"vpn.settings.remove\": {\"icon\":\"󰆴\",\"label\":\"Remove\",\"when\":\"$SELF list | grep -q .\"},"$'\n'
+  while read -r n; do
+    [[ -n "$n" ]] || continue
+    block+="  \"vpn.settings.remove.$n\": {\"icon\":\"󰆴\",\"label\":\"$(label "$n")\",\"description\":\"$n\",\"action\":\"$SELF remove $n\"},"$'\n'
+  done < <(connections)
+  block+="  // <<< vpn"
+  mkdir -p "$(dirname "$MENU_FILE")"
+  [[ -f "$MENU_FILE" ]] || printf '{\n}\n' > "$MENU_FILE"
+  BLOCK="$block" python3 - "$MENU_FILE" <<'PY'
+import os, re, sys
+path = sys.argv[1]; block = os.environ["BLOCK"]
+s = open(path).read()
+s = re.sub(r"[ \t]*// >>> protonvpn.*?// <<< protonvpn[ \t]*\n?", "", s, count=1, flags=re.S)   # alter Block (bis 08.09.2026)
+pat = re.compile(r"[ \t]*// >>> vpn.*?// <<< vpn[ \t]*\n?", re.S)
+if pat.search(s):
+    s = pat.sub(lambda m: block + "\n", s, count=1)   # a function: re.sub would otherwise eat the backslashes in the block
+else:
+    i = s.rstrip().rfind("}")
+    s = s[:i].rstrip("\n") + "\n\n" + block + "\n" + s[i:]
+open(path, "w").write(s)
+PY
+  omarchy-menu refresh >/dev/null 2>&1 || true
+  echo "Menu written: $(connections | paste -sd' ') (default: ${def:-none})"
+}
+
+# The version lives in exactly one place, manifest.json, so there is no second copy to forget. Read it from the
+# installed plugin first, because that is what the user is running, then from a manifest next to this script.
+manifest_version() { sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
+version() {
+  local sib m v sv
+  sib="$(dirname "$SELF")/manifest.json"
+  for m in "$PLUGIN_DIR/manifest.json" "$sib"; do
+    [[ -r "$m" ]] || continue
+    v=$(manifest_version "$m")
+    [[ -n "$v" ]] || continue
+    printf 'tun0 VPN %s\n' "$v"
+    # Preparing a release is the one moment when a checkout carries a newer number than the installed plugin.
+    # Reporting only the installed one would answer the wrong question exactly then.
+    if [[ "$m" != "$sib" && -r "$sib" ]]; then
+      sv=$(manifest_version "$sib")
+      [[ -n "$sv" && "$sv" != "$v" ]] && echo "note: this is the installed plugin; the checkout next to this script says $sv" >&2
+    fi
+    return 0
+  done
+  echo "tun0 VPN: no readable manifest.json, version unknown" >&2
+  return 1
+}
+
+case "${1:-status}" in
+  on|up)        connect "${2:-}" ;;
+  off|down)     disconnect ;;
+  # A click while a connect is still negotiating cancels it - what the icon tooltip promises - instead of
+  # starting a second, racing attempt. Hence live (activated OR activating), not active.
+  toggle)       # "wanted" (marker) or already negotiating -> off; the marker closes the gap between `ks arm`
+                # and the first moment NM lists the profile as activating, so a double click cannot start two connects
+                if [[ -e "$MARK" || -n "$(live)" ]]; then disconnect; else connect ""; fi ;;
+  status)       status --ip ;;
+  list)         cur=$(active); def=$(default_con)
+                connections | while read -r n; do m=" "; [[ "$n" == "$cur" ]] && m="*"; [[ "$n" == "$def" ]] && m="$m="; printf '%s%s\t%s\n' "$m" "$n" "$(label "$n")"; done ;;
+  default)      if [[ -n "${2:-}" ]]; then
+                  n=$(resolve "$2") || die_unknown "$2"
+                  ks set default "$n" || exit 1; menu_write >/dev/null; notify "VPN" "Default: $(label "$n") ($n)"
+                fi
+                default_con ;;
+  killswitch)   case "${2:-}" in
+                  on|off) ks set killswitch "$2" || exit 1; notify "VPN" "Kill switch $2" ;;
+                  toggle) if [[ "$(ks_setting)" == "off" ]]; then "$SELF" killswitch on; else "$SELF" killswitch off; fi; exit ;;
+                  "") ;;
+                  *) echo "vpn killswitch [on|off|toggle]" >&2; exit 2 ;;
+                esac
+                v=$(ks_setting); echo "kill switch setting: ${v:-on}" ;;
+  is-killswitch) [[ "$(ks_setting)" != "off" ]] ;;
+  trust)        trust "${2:-}" "${3:-}" ;;
+  ssid)         current_ssid ;;
+  auto)         auto "${2:-}" ;;                   # internal: the bar poll calls this; --dry-run prints the dispatcher's last decision
+  autoconnect|autodisconnect)
+                key=$1
+                case "${2:-}" in
+                  on|off) ks set "$key" "$2" || exit 1; menu_write >/dev/null; notify "VPN" "$key $2" ;;
+                  toggle) if [[ "$(user_setting "$key")" == "on" ]]; then "$SELF" "$key" off; else "$SELF" "$key" on; fi; exit ;;
+                  "") ;;
+                  *) echo "vpn $key [on|off|toggle]" >&2; exit 2 ;;
+                esac
+                v=$(user_setting "$key"); echo "$key: ${v:-off}" ;;
+  is-autoconnect)    [[ "$(user_setting autoconnect)" == "on" ]] ;;
+  is-autodisconnect) [[ "$(user_setting autodisconnect)" == "on" ]] ;;
+  is-trusted)   is_trusted "$(current_ssid)" ;;
+  recent)       recent ;;
+  add)          add "${2:-}" ;;
+  remove)       remove "${2:-}" ;;
+  menu)         exec omarchy-menu summon vpn ;;
+  version|--version|-V) version ;;
+  menu-write)   menu_write --create ;;             # explicit: (re)create the Omarchy menu block
+  indicator)    indicator ;;
+  json)         auto; json_state ;;              # internal: everything the bar widget shows, one call; the
+                                                 # toast for the dispatcher's last decision rides on this poll, like on `indicator`
+  public)       public_ip ;;                     # internal: public IP + geo as JSON (slow, on demand)
+  logo)         logo ;;                            # internal: the header inside the floating terminal
+  present)      shift; present "$@" ;;             # internal: re-run in a floating terminal with that header
+  is-on)        [[ -n "$(active)" ]] ;;
+  is-wanted)    [[ -e "$MARK" || -n "$(active)" ]] ;;   # kill switch armed or tunnel up -> offer Disconnect
+  is-active)    [[ -n "${2:-}" && "$(active)" == "$2" ]] ;;
+  is-default)   [[ -n "${2:-}" && "$(default_con)" == "$2" ]] ;;
+  *)            sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac

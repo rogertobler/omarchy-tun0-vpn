@@ -1,0 +1,19 @@
+[Unit]
+Description=tun0 VPN kill switch (nftables table, loaded before the network comes up)
+Documentation=https://github.com/rogertobler/omarchy-tun0-vpn
+# Before NetworkManager: the table must exist when the first interface comes up, or its first packets are free.
+# The dispatcher then opens trusted and wired interfaces; closed is the state nothing has to be done for.
+DefaultDependencies=no
+After=local-fs.target
+Wants=network-pre.target
+Before=network-pre.target NetworkManager.service
+ConditionPathExists=/etc/vpn/killswitch.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/vpn-root boot
+ExecStop=/usr/local/bin/vpn-root unload
+
+[Install]
+WantedBy=multi-user.target
