@@ -73,8 +73,8 @@ environment and by its full path. Read it before you paste it; it is short.
 
 ```bash
 /usr/bin/sudo /usr/bin/env -i PATH=/usr/bin HOME=/root LC_ALL=C SUDO_USER="$(/usr/bin/id -un)" /usr/bin/bash -euo pipefail -s <<'BOOTSTRAP'
-C=@RELEASE_COMMIT@   # the release commit of v1.1.1
-S=@RELEASE_SUMS@   # SHA-256 of SHA256SUMS in that commit
+C=14049d5d4d22b14c632937518b60f95dc282a7ef   # the release commit of v1.1.1
+S=6f5b1eadb8b37fafdf812af50e90518153af68c5cfda12a477068201458e1b0a   # SHA-256 of SHA256SUMS in that commit
 K='git@rogertobler.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPRq/nVA2tJpshyb4X5oDKZ/3mkWeuk9HH3Dor3cHdua'
 T=/usr/local/lib/tun0-vpn
 P=/etc/vpn/release-signer
@@ -192,7 +192,7 @@ verified release in place (the same commit `C`). It opens those files with your 
 contents to the root helper:
 
 ```bash
-sudo /usr/local/lib/tun0-vpn/install.sh --commit @RELEASE_COMMIT@ proton-ch ~/Downloads/ch.protonvpn.udp.ovpn mullvad-se ~/Downloads/mullvad_se_all.conf
+sudo /usr/local/lib/tun0-vpn/install.sh --commit 14049d5d4d22b14c632937518b60f95dc282a7ef proton-ch ~/Downloads/ch.protonvpn.udp.ovpn mullvad-se ~/Downloads/mullvad_se_all.conf
 ```
 
 > [!NOTE]
