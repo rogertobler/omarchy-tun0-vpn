@@ -59,11 +59,11 @@ function heroMeta(d) {
     case "down":
       return (d.killswitch === "disabled" ? "kill switch DISABLED" : d.killswitch === "unloaded" ? "kill switch NOT LOADED" : "kill switch holding") + " · retrying " + name
     default:
-      return (d["default"] ? "default: " + label : "no profile yet - add one below") + (d.killswitch === "disabled" ? " · kill switch disabled" : "")
+      return (d["default"] ? "default: " + label : "no profile yet, add one below") + (d.killswitch === "disabled" ? " · kill switch disabled" : "")
   }
 }
 // "on" only when the uplink really is shut. "unloaded" is the state the docs promise to make visible: the
-// setting says on, but no table exists (no profile yet, or the unit was stopped) - nothing is blocked.
+// setting says on, but no table exists (no profile yet, or the unit was stopped): nothing is blocked.
 function ksWord(d) {
   if (d.killswitch === "disabled") return "disabled"
   if (d.killswitch === "unloaded") return "NOT LOADED"
@@ -73,7 +73,7 @@ function ksWord(d) {
 
 // Which Wi-Fi rows the panel shows. `known` arrives most recently used first. With a filter: every fuzzy
 // match. Without: the network you are on, every trusted one, then the last `recent` untrusted networks you
-// actually used - a laptop can know a hundred networks and the panel is not the place to scroll through
+// actually used; a laptop can know a hundred networks and the panel is not the place to scroll through
 // them; "show all" lifts the cap.
 function wifiRows(known, trusted, current, filter, recent, showAll) {
   var q = String(filter || "").toLowerCase().trim()
@@ -143,7 +143,7 @@ function profileDescription(p) {
 }
 
 function networkDescription(d) {
-  if (!d || !d.ssid) return "not on Wi-Fi - wired and offline are left alone"
+  if (!d || !d.ssid) return "not on Wi-Fi (wired and offline are left alone)"
   var manual = d.manual ? " · automation paused here (you switched by hand)" : ""
   if (d.trusted) return "trusted" + (d.autodisconnect && !d.manual ? " · the tunnel drops here by itself" : "") + manual
   return "untrusted" + (d.autoconnect && !d.manual ? " · the tunnel comes up here by itself" : "") + manual
@@ -153,7 +153,7 @@ function killswitchDescription(d) {
   if (!d) return ""
   if (d.state === "unknown") return "unknown: the state could not be read, see the message above"
   if (d.killswitch === "disabled") return "off: profiles, watchdog and icon work as usual, nothing is ever blocked"
-  if (d.killswitch === "unloaded") return "NOT LOADED: no table, nothing is blocked - no profile yet, or the unit was stopped (sudo systemctl start vpn-killswitch)"
+  if (d.killswitch === "unloaded") return "NOT LOADED: no table, nothing is blocked. No profile yet, or the unit was stopped (sudo systemctl start vpn-killswitch)"
   if (d.state === "connected") return "on: only the tunnel and the handshake to the VPN servers may leave"
   if (d.state === "down" || d.state === "stalled") return "holding: no tunnel, nothing leaves until it is back or you say off"
   if (d.killswitch === "on") return "on: the uplink is shut, only the tunnel and the handshake may leave"
@@ -164,14 +164,14 @@ function barTooltip(d, rates) {
   if (!d) return "tun0 VPN"
   var lines = []
   switch (d.state) {
-    case "unknown": lines.push("VPN state unknown - `vpn json` failed, open the panel for the reason"); break
+    case "unknown": lines.push("VPN state unknown: `vpn json` failed, open the panel for the reason"); break
     case "connected":
       lines.push(d.label + " (" + d.active + "), kill switch " + ksWord(d))
       if (rates) lines.push("↓ " + fmtRate(rates.rx) + "  ↑ " + fmtRate(rates.tx))
       break
     case "connecting": lines.push("Connecting to " + d.label + " (" + d.want + ")"); break
-    case "stalled": lines.push("Tunnel stalled - " + d.label + " (" + d.active + "): the uplink lost its link or the server is not answering, OpenVPN keeps restarting. Nothing flows until it is back."); break
-    case "down": lines.push("VPN down - " + (d.killswitch === "disabled" ? "kill switch DISABLED" : d.killswitch === "unloaded" ? "kill switch NOT LOADED" : "kill switch is blocking") + ", watchdog retrying " + d.want); break
+    case "stalled": lines.push("Tunnel stalled: " + d.label + " (" + d.active + "): the uplink lost its link or the server is not answering, OpenVPN keeps restarting. Nothing flows until it is back."); break
+    case "down": lines.push("VPN down: " + (d.killswitch === "disabled" ? "kill switch DISABLED" : d.killswitch === "unloaded" ? "kill switch NOT LOADED" : "kill switch is blocking") + ", watchdog retrying " + d.want); break
     default: lines.push("VPN off" + (d["default"] ? " (default: " + d["default"] + ")" : "") + (d.killswitch === "disabled" ? " · kill switch disabled" : ""))
   }
   if (d.ssid) lines.push("Wi-Fi " + d.ssid + " · " + (d.trusted ? "trusted" : "untrusted"))

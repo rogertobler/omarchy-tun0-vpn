@@ -133,10 +133,12 @@ too, otherwise auto-disconnect on a trusted network would tear it down at once.
   shut throughout.
 - The sudoers rule means any process running as you can open the kill switch. It protects you from the network,
   not from software you run.
-- The first installation trusts the release that root clones from GitHub, and the key named in it. From then on
-  that key is pinned, and `vpn-update` checks every later release against it before anything of that release runs;
-  a change of key is refused until you remove `/etc/vpn/release-signer` by hand. Running the `install.sh` of a
-  release by hand, past `vpn-update`, trusts that release as the first installation does.
+- The first bootstrap trusts the commit, the digest and the key it is given, and those are only as good as the README
+  they are copied from: the README at the commit the marketplace verified (the release tag's README holds placeholders,
+  which the bootstrap refuses), with the key compared against the account's signing keys. From then on the key is
+  pinned, and a later bootstrap with another key stops before it changes anything; a README changed on GitHub that keeps
+  the key still needs a commit that key signed. What runs in the user's own terminal while the bootstrap is pasted is
+  outside what it can check. Running `install.sh` by hand, past the bootstrap, trusts that tree.
 - The public IP lookup sends one request to ipinfo.io whenever the state changes to connected or off; ipinfo.io learns
   that this address uses the plugin at those moments. `vpn lookup off` turns it off.
 
@@ -146,22 +148,31 @@ A plugin folder belongs to you, and so does every program you run. Whatever root
 state some program running as you may have set a moment earlier: a script replaced between typing `sudo` and its
 start, a file swapped between the check and the copy, a link where a file was. So root reads nothing from there.
 
-- **Where the root side comes from.** Root clones the release itself, into `/usr/local/lib/tun0-vpn`, and
-  `install.sh` runs only from exactly there. The clone must follow exactly the tag `v<version>` (`remote.origin.fetch`
-  as `git clone --branch` writes it): a branch, or an unsigned tag, named like a newer release but sitting on the
-  commit of an older one would otherwise install that older release under the name asked for. `vpn-update` sets the
-  same after it fetched a release. Before it changes anything it checks that every directory from `/` down
-  to that tree and everything in it belongs to root and is writable by root only, that the checkout is the
-  unmodified commit of the release tag, and that the tag is signed by the release key. The key is written into
-  `install.sh`, listed as a signing key of the GitHub account, and pinned in `/etc/vpn/release-signer` at the first
-  installation.
-- **Updates.** A check inside the new release protects nothing, because a changed release would simply leave it
-  out. So the check runs in the release installed now: `install.sh` puts `vpn-update` into `/usr/local/bin`, and
-  `vpn-update` fetches the new tag, checks its signature against the pinned key, checks that the tagged commit
-  carries the version asked for and that it is not older than the installed release (recorded in
-  `/etc/vpn/installed-release`), and only then checks it out and hands over to its `install.sh`. The tag is fetched
-  afresh every time into a ref of its own, without following other tags, and its name inside the signed object must
-  be the name asked for: a signature covers what the tag says it is, not the name a server serves it under.
+- **Where the root side comes from: a bootstrap that checks before anything runs.** A check inside a release protects
+  nothing on the way in, because a changed release would simply leave it out, and it would already be running as root
+  when it got to it. So the root side is installed by a bootstrap the user pastes, whose bytes come from the README and
+  not from the release it fetches. It runs as root with an empty environment and every command by its full path. Before
+  it touches anything it refuses placeholder values, any directory from `/` down to `/usr/local/lib` that anyone but
+  root can write to, and, on an update, a key other than the one pinned in `/etc/vpn/release-signer`: a check of the
+  pin inside `install.sh` would come after the fetched code already runs. git gets no global or system configuration,
+  no hooks, no fsmonitor, no password prompt, HTTPS as its only transport, a minimum transfer speed, object checks on
+  fetch, and no signature program but `ssh-keygen` (`gpg.format` does not decide how a signature is checked, the
+  signature does, so gpg and gpgsm are switched off). It creates an empty repository in `/usr/local/lib/tun0-vpn`,
+  fetches exactly one commit by its full hash, and checks, before anything of it is checked out, that the commit is
+  signed by the release key and that its `SHA256SUMS` has the SHA-256 the README names. Only then does it check the
+  files out, check every file `SHA256SUMS` lists (everything `install.sh` installs, and `install.sh` itself; README,
+  DESIGN, CHANGELOG and LICENSE are bound by the commit only, and nothing runs them) and that no file outside the
+  commit is in the tree, and start `install.sh --commit`.
+  `install.sh` repeats the checks (commit, signature, clean tree, ownership chain, digests), compares the release key
+  with the one pinned in `/etc/vpn/release-signer` and refuses a release older than the one recorded in
+  `/etc/vpn/installed-release`. The marketplace security review asked for exactly this order.
+- **Two commits per release.** A README cannot name the hash of its own commit. So a release is a signed release
+  commit with its tag, followed by a signed commit that changes nothing but the README, writing that release commit's
+  hash and the digest of its `SHA256SUMS` wherever the README names them. `git diff <release commit> <that commit>`
+  shows these values and nothing else.
+- **Updates.** An update is the same bootstrap with the values of the newer release. There is no updater on the
+  machine: an updater that accepts whatever the release key signs would install a release nobody reviewed. 1.1.0
+  shipped one (`vpn-update`); `install.sh` removes it.
 - **What is installed.** Each file, the widget files included, is checked in the tree for its canonical path, owner
   and mode, then copied into a staging directory only root can read, and the SHA-256 of that copy is checked against
   `SHA256SUMS` in the signed commit. The copy is what is installed; the tree is not read again, so a file changed
@@ -250,6 +261,7 @@ start, a file swapped between the check and the copy, a link where a file was. S
 
 ## Versioning
 
-The version lives in `manifest.json` only. `vpn version` prints the installed one. Every release is one commit
-on `main`, tagged `vX.Y.Z`, with a GitHub release carrying the CHANGELOG section; between releases `main` stands
-still, because the marketplace pins a listing to an exact commit.
+The version lives in `manifest.json` only. `vpn version` prints the installed one. Every release is two signed
+commits on `main`: the release commit, tagged `vX.Y.Z`, and the commit that writes its hash and the digest of its
+`SHA256SUMS` into the README (see the boundary above). A GitHub release carries the CHANGELOG section; between releases
+`main` stands still, because the marketplace pins a listing to an exact commit.

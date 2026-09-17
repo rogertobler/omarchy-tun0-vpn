@@ -32,7 +32,7 @@ tunnel: when it drops, and in the seconds before it is up. What it does not cove
 
 ```
 VPN:         connected, Proton · Switzerland (proton-ch)
-Kill switch: on - uplink shut, only the tunnel may carry traffic
+Kill switch: on (uplink shut, only the tunnel may carry traffic)
 Public IP:   79.135.104.7
 Seen as:     Switzerland (CH), Zürich · Proton AG
 ```
@@ -59,24 +59,83 @@ own daemon are out of scope.
 ```bash
 sudo pacman -S --needed networkmanager-openvpn                         # the one requirement Omarchy does not ship
 omarchy plugin add https://github.com/rogertobler/omarchy-tun0-vpn     # the widget, like any other plugin
-sudo git clone --depth 1 --branch v1.1.0 https://github.com/rogertobler/omarchy-tun0-vpn /usr/local/lib/tun0-vpn
-sudo /usr/local/lib/tun0-vpn/install.sh                                # the part that needs root, once
+```
+
+The root side is installed by a bootstrap you paste into a terminal, not by a script from the repository. Nothing of
+the release runs, and nothing of it is checked out, before the bootstrap has checked it. It stops at once if the
+values below are placeholders, if anyone but root can write to a directory above the release directory, or, on an
+update, if the key below is not the one the installation before pinned. Then it fetches exactly the release commit
+named below into a directory only root can write to, checks that the commit is signed by the release key named below
+(with `ssh-keygen`, no other signature program), checks that its `SHA256SUMS` has the digest named below, and only then
+checks the files out, checks every file `SHA256SUMS` lists (all the files `install.sh` installs, and `install.sh`
+itself) and that no file outside the commit is there, and starts `install.sh`. Every command runs with an empty
+environment and by its full path. Read it before you paste it; it is short.
+
+```bash
+/usr/bin/sudo /usr/bin/env -i PATH=/usr/bin HOME=/root LC_ALL=C SUDO_USER="$(/usr/bin/id -un)" /usr/bin/bash -euo pipefail -s <<'BOOTSTRAP'
+C=@RELEASE_COMMIT@   # the release commit of v1.1.1
+S=@RELEASE_SUMS@   # SHA-256 of SHA256SUMS in that commit
+K='git@rogertobler.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPRq/nVA2tJpshyb4X5oDKZ/3mkWeuk9HH3Dor3cHdua'
+T=/usr/local/lib/tun0-vpn
+P=/etc/vpn/release-signer
+[[ $C =~ ^[0-9a-f]{40}$ && $S =~ ^[0-9a-f]{64}$ ]] || { echo "C and S are placeholders: copy this from the README at the verified commit" >&2; exit 1; }
+D=$(/usr/bin/find / /usr /usr/local /usr/local/lib -maxdepth 0 \( ! -user 0 -o -perm /022 \))
+test -z "$D" || { echo "writable by others than root: $D" >&2; exit 1; }
+if test -e "$P" || test -L "$P"; then                             # an update: K must be the key pinned before
+  test "$(/usr/bin/cat "$P")" = "$K" || { echo "K is not the release key pinned in $P. Nothing was changed." >&2; exit 1; }
+fi
+umask 022
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+V=$(/usr/bin/mktemp -d /run/tun0-vpn-bootstrap.XXXXXX)
+trap '/usr/bin/rm -rf "$V"' EXIT
+printf '%s\n' "$K" > "$V/allowed_signers"
+g() {
+  /usr/bin/git -C "$T" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c protocol.allow=never -c protocol.https.allow=always -c transfer.fsckObjects=true \
+    -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 -c gpg.format=ssh -c gpg.ssh.program=/usr/bin/ssh-keygen \
+    -c gpg.ssh.allowedSignersFile="$V/allowed_signers" -c gpg.openpgp.program=/usr/bin/false -c gpg.x509.program=/usr/bin/false "$@"
+}
+/usr/bin/rm -rf "$T"
+/usr/bin/install -d -m 755 "$T"
+g init -q
+g fetch -q --no-tags --depth 1 https://github.com/rogertobler/omarchy-tun0-vpn "$C"
+g verify-commit "$C"                                              # signed by the release key K, checked by ssh-keygen only
+g cat-file blob "$C:SHA256SUMS" > "$V/sums"
+printf '%s  %s\n' "$S" "$V/sums" | /usr/bin/sha256sum --strict --quiet -c   # that file list has the digest S
+g checkout -q --detach "$C"                                       # only now is anything of it checked out
+(cd "$T" && /usr/bin/sha256sum --strict --quiet -c SHA256SUMS)    # every listed file against that list
+U=$(g status --porcelain --ignored --untracked-files=all)
+test -z "$U"                                                      # and no file that is not in the commit
+"$T/install.sh" --commit "$C"
+BOOTSTRAP
+```
+
+Then add a profile:
+
+```bash
 vpn add ~/Downloads/ch.protonvpn.udp.ovpn                              # or: open the panel, press +
 vpn on && vpn status
 ```
 
-The root side is installed from its own copy of the release, cloned by root into a directory only root can write
-to, never from the plugin folder: that folder belongs to you, and so does every program you run, which could change
-a script there while `sudo` runs it. `install.sh` refuses to run from anywhere else, checks that the release tag is
-signed by the release key and that every file it installs matches the digest in the signed commit, and only then
-changes the system. This first installation trusts the tag it clones from GitHub; from then on the release key is
-pinned on your machine, and [Update](#update) checks every later release against it before anything of that release
-runs. How, in detail: [How the root side is installed](#how-the-root-side-is-installed).
-Read [Permissions](#permissions) before you run it; it is short.
+**Where the trust starts.** The commit `C`, the digest `S` and the key `K` are the three values the bootstrap trusts,
+and they are only as good as the page you copy them from: copy the bootstrap from this README at the commit the Omarchy
+marketplace verified for this plugin (not from the release tag: its README holds placeholders, and the bootstrap
+refuses them), and compare `K` with the [signing keys of the account](https://api.github.com/users/rogertobler/ssh_signing_keys)
+(fingerprint `SHA256:BP0m/tn2dfpS+7xOCWmG6ioYfUrbdSIqmNHNuRb/txQ`). After the first installation `K` is pinned in
+`/etc/vpn/release-signer`, and a later bootstrap with another key stops before it changes anything. The values are
+written into this README by a commit of their own right after the release commit, because a commit cannot name its
+own hash; that commit changes nothing but the release commit and its digest, wherever this README names them. What runs
+in your own terminal while you paste, including anything a program you ran before left in that shell, is outside what
+the bootstrap can check.
 
-Coming from 1.0.0: skip `omarchy plugin add` (the widget is there already), then clone and run `install.sh` as
-above. `install.sh` refreshes a widget folder the 1.0.0 installer copied; a folder `omarchy plugin add` cloned is
-updated with `omarchy plugin update rogertobler.tun0-vpn`.
+The root side never comes from the plugin folder: that folder belongs to you, and so does every program you run, which
+could change a script there while it runs as root. How the installer checks the release once more, in detail:
+[How the root side is installed](#how-the-root-side-is-installed). Read [Permissions](#permissions) before you run it;
+it is short.
+
+Coming from 1.0.0 or 1.1.0: skip `omarchy plugin add` (the widget is there already) and paste the bootstrap.
+`install.sh` refreshes a widget folder an earlier installer copied, and removes the `vpn-update` of 1.1.0; a folder
+`omarchy plugin add` cloned is updated with `omarchy plugin update rogertobler.tun0-vpn`.
 
 ## Requirements
 
@@ -128,11 +187,12 @@ name is `<provider>-<country>`, lowercase, one dash; the provider half is a labe
 a `remote` line, a taken name or empty credentials send you back to that step, not to the
 start.
 
-Several at once, also from different providers, as `NAME FILE` pairs to the installer. It opens those files with
-your rights, not root's, and hands their contents to the root helper:
+Several at once, also from different providers, as `NAME FILE` pairs to the installer, once the bootstrap has put the
+verified release in place (the same commit `C`). It opens those files with your rights, not root's, and hands their
+contents to the root helper:
 
 ```bash
-sudo /usr/local/lib/tun0-vpn/install.sh proton-ch ~/Downloads/ch.protonvpn.udp.ovpn mullvad-se ~/Downloads/mullvad_se_all.conf
+sudo /usr/local/lib/tun0-vpn/install.sh --commit @RELEASE_COMMIT@ proton-ch ~/Downloads/ch.protonvpn.udp.ovpn mullvad-se ~/Downloads/mullvad_se_all.conf
 ```
 
 > [!NOTE]
@@ -271,9 +331,9 @@ How it is built, why, and the incidents that shaped it: [DESIGN.md](DESIGN.md).
 
 | What | Where | Why |
 |---|---|---|
-| **The release** | `/usr/local/lib/tun0-vpn/`, writable by root only | the clone `install.sh` installs from, and runs from. Nothing root installs comes from a folder you can write to |
-| **A pinned release key** | `/etc/vpn/release-signer` | written at the first installation; `vpn-update` accepts only releases signed by it, and `install.sh` refuses a release that names another key |
-| **The installed release** | `/etc/vpn/installed-release` | version and commit, written last; neither `vpn-update` nor `install.sh` goes back to an older release |
+| **The release** | `/usr/local/lib/tun0-vpn/`, writable by root only | the release commit the bootstrap fetched and verified; `install.sh` installs from it and runs from it. Nothing root installs comes from a folder you can write to |
+| **A pinned release key** | `/etc/vpn/release-signer` | written at the first installation; `install.sh` refuses a later release that names another key |
+| **The installed release** | `/etc/vpn/installed-release` | version and commit, written last; `install.sh` does not go back to an older release |
 | **A root helper** | `/usr/local/bin/vpn-root` | loads the nftables table, opens and shuts interfaces in it, writes the marker, keeps the trusted list and the settings, imports NetworkManager profiles, stores configs and credentials, runs the watchdog |
 | **A sudoers rule** | `/etc/sudoers.d/vpn` (mode 0440), bound to the user id of whoever ran the installer | lets that user run **that one script** without a password, only in the argument forms the user side needs, and only while it has the SHA-256 the release installed. No `ALL`, no shell, no interpreter |
 | **A dispatcher script** | `/etc/NetworkManager/dispatcher.d/90-vpn-killswitch`, linked into `pre-up.d/` and `pre-down.d/` | opens a trusted or wired interface before NetworkManager declares it usable, keeps an untrusted one shut, shuts it again at `pre-down`, and learns when a tunnel came up or went away |
@@ -281,11 +341,11 @@ How it is built, why, and the incidents that shaped it: [DESIGN.md](DESIGN.md).
 | **A transient unit** | `vpn-reconnect`, via `systemd-run` | the watchdog. Not enabled, gone after a reboot |
 | **Files under `/etc/vpn/`** | configs and credentials root only (`600`), trusted list and settings world readable | the dispatcher reads them before anyone is logged in |
 | **The widget** | `~/.config/omarchy/plugins/rogertobler.tun0-vpn/` and one layout entry in `~/.config/omarchy/shell.json`, written by `omarchy plugin enable` | the shield and the panel. A folder `omarchy plugin add` cloned is left to Omarchy; a folder without git gets the checked widget files of the release, written with your rights |
-| **Three scripts** | `~/.local/bin/vpn`, `/usr/local/bin/vpn-update`, `/usr/local/bin/vpn-uninstall` | the user side, the updater of the root side, and a copy of the uninstaller that survives `omarchy plugin remove` |
+| **Two scripts** | `~/.local/bin/vpn`, `/usr/local/bin/vpn-uninstall` | the user side, and a copy of the uninstaller that survives `omarchy plugin remove` |
 
-What it does not do: no `curl | sh`, nothing it downloads or updates on its own (the first clone and every
-update are commands you type; an update is checked against the pinned key before any of it runs), no daemon, no
-profile connects on its own unless auto-connect is on.
+What it does not do: no `curl | sh`, nothing it downloads or updates on its own (installing and every update are the
+bootstrap you paste, which checks a release before any of it runs), no updater that accepts whatever the key signs, no
+daemon, no profile connects on its own unless auto-connect is on.
 
 The attack surface of the sudoers rule: the helper's actions are fixed, and the rule itself admits only these
 argument lists, each matched whole:
@@ -316,19 +376,17 @@ is left alone.
 
 ### How the root side is installed
 
-`install.sh` changes nothing before all of this has passed:
+The bootstrap (see [Install](#install)) checks the release before anything of it runs, and on an update that its key
+is the pinned one. `install.sh` then checks it once more, and changes nothing before all of this has passed:
 
 - it runs from exactly `/usr/local/lib/tun0-vpn/install.sh`, every directory from `/` down to that tree and
   everything in the tree belongs to root and is writable by root only, and nothing in the tree is a link
 - what it needs is installed (see [Requirements](#requirements)); it installs no packages itself
-- the checkout is the unmodified commit of the release tag `v<version>`, and that tag is signed by the release key.
-  That key is written into `install.sh` and listed as a signing key of the GitHub account
+- the checkout is exactly the commit the bootstrap passed with `--commit`, unmodified, and that commit is signed by the
+  release key. That key is written into `install.sh` and listed as a signing key of the GitHub account
   ([rogertobler](https://api.github.com/users/rogertobler/ssh_signing_keys), fingerprint
   `SHA256:BP0m/tn2dfpS+7xOCWmG6ioYfUrbdSIqmNHNuRb/txQ`). If a key is already pinned in `/etc/vpn/release-signer`,
-  it must be that one; the release must not be older than the one recorded in `/etc/vpn/installed-release`; and
-  every tag in the clone must name itself as it is called, so a signed tag served under another name is refused.
-  The clone must have been made with `--branch v<version>`, so a branch or an unsigned tag named like a newer release
-  on the commit of an older one does not install that older release
+  it must be that one, and the release must not be older than the one recorded in `/etc/vpn/installed-release`
 - each file it installs, the widget files included, is checked in the tree for its canonical path, owner and mode,
   then copied into a staging directory only root can read, and the SHA-256 of that copy is checked against
   `SHA256SUMS` of the signed commit. What is installed is that copy, never the tree again
@@ -339,32 +397,22 @@ is left alone.
   the credentials they need have been asked for
 
 Then it removes the sudoers rule, installs everything else, and writes the rule (bound to the digest of the
-`vpn-root` it installed), the pinned key (the first time) and the installed release last. If it stops in between, it says that the rule stays removed until it runs through. Your
-home directory (the `vpn` command, the widget) is written with your rights, not root's.
-
-What this does not cover: the first installation trusts the tag it clones from GitHub, and the key named in that
-release. It prints the fingerprint it pins; compare it with the one above and with the account's
-[signing keys](https://api.github.com/users/rogertobler/ssh_signing_keys). The protection against a changed
-repository starts with the second release, through `vpn-update`.
+`vpn-root` it installed), the pinned key (the first time) and the installed release last. If it stops in between, it
+says that the rule stays removed until it runs through. Your home directory (the `vpn` command, the widget) is written
+with your rights, not root's.
 
 ## Update
 
 ```bash
 omarchy plugin update rogertobler.tun0-vpn
-sudo /usr/local/bin/vpn-update v1.1.0
 ```
 
-Name the release you update to. `vpn-update` is the updater of the release installed now, not of the new one: it
-fetches the tag from this repository into `/usr/local/lib/tun0-vpn` (afresh every time, so a tag a server once
-served wrong does not stay), and before anything of the new release runs it checks that the tag is signed by the key
-pinned in `/etc/vpn/release-signer`, that it names itself as the release asked for, that the tagged commit carries
-that version, and that it is not older than the installed release. Then it checks the tag out and hands over to its
-`install.sh`, which checks the whole release again. Configs, credentials, trusted networks, settings and default
-survive; scripts, unit, dispatcher, rules template and sudoers rule are rewritten, and the NetworkManager profiles
-are re-imported from the stored configs, so a manual `nmcli con mod` on a profile is reset. `omarchy update` leaves
-all of it alone.
-
-From 1.0.0, which ran its installer from the plugin folder and has no `vpn-update`: follow [Install](#install).
+Then paste the bootstrap from [Install](#install) as it stands in the README of the newer release: same commands, the
+commit and the digest of that release. There is no updater on your machine that accepts a release by itself; every
+release is checked against the values you paste before any of it runs. Configs, credentials, trusted networks, settings
+and default survive; scripts, unit, dispatcher, rules template and sudoers rule are rewritten, and the NetworkManager
+profiles are re-imported from the stored configs, so a manual `nmcli con mod` on a profile is reset. `install.sh`
+refuses a release older than the one installed. `omarchy update` leaves all of it alone.
 
 ## Uninstall
 
@@ -416,8 +464,7 @@ vpn                     = vpn status; up/down = on/off
                                        add NAME / remove / rebuild  configs (add: the .ovpn on stdin), rules, NM profiles
                                        has-auth PROVIDER          are credentials stored for this provider?
 /usr/local/bin/vpn-uninstall         copy of uninstall.sh
-/usr/local/bin/vpn-update            updates the root side to a newer release, checked against the pinned key
-/usr/local/lib/tun0-vpn/             the release root cloned and installs from (writable by root only)
+/usr/local/lib/tun0-vpn/             the release commit the bootstrap fetched, verified and installs from (writable by root only)
 /etc/systemd/system/vpn-killswitch.service
                                      loads the table before NetworkManager, at every boot
 /etc/NetworkManager/dispatcher.d/90-vpn-killswitch   (+ symlinks in pre-up.d/ and pre-down.d/)
@@ -447,13 +494,12 @@ disconnect from a drop. `vpn status` says `NOT LOADED` whenever the table is gon
 | `vpn` | `~/.local/bin/vpn` |
 | `vpn-root` | `/usr/local/bin/vpn-root` |
 | `uninstall.sh` | `/usr/local/bin/vpn-uninstall` (a copy) |
-| `vpn-update` | `/usr/local/bin/vpn-update` |
 | `90-vpn-killswitch` | `/etc/NetworkManager/dispatcher.d/90-vpn-killswitch`, plus symlinks in `pre-up.d/` and `pre-down.d/` |
 | `vpn-killswitch.service` | `/etc/systemd/system/vpn-killswitch.service`, enabled |
-| `sudoers-vpn.in` | `/etc/sudoers.d/vpn` (`@UID@` = the user id of whoever runs the installer with `sudo`) |
+| `sudoers-vpn.in` | `/etc/sudoers.d/vpn` (`@UID@` = the user id of the account that pastes the bootstrap) |
 | `killswitch.nft.in` | `/etc/vpn/killswitch.nft.in` |
-| `SHA256SUMS` | not installed: the digests `install.sh` checks each file of this table against |
-| `install.sh` | not installed: runs from `/usr/local/lib/tun0-vpn/` only |
+| `SHA256SUMS` | not installed: the digests the bootstrap and `install.sh` check each file of this table against, `install.sh` included |
+| `install.sh` | not installed: runs from `/usr/local/lib/tun0-vpn/` only, started by the bootstrap |
 | `manifest.json`, `BarWidget.qml`, `Service.qml`, `Model.js`, `preview.png` | `~/.config/omarchy/plugins/rogertobler.tun0-vpn/` (by `omarchy plugin add`, or by `install.sh` when that folder is missing) |
 
 Optional: `vpn menu-write` adds a VPN block to the Omarchy menu (`~/.config/omarchy/extensions/omarchy-menu.jsonc`)
@@ -471,14 +517,14 @@ same actions.
 | New Wi-Fi, no network, no VPN yet | `vpn status` says "Kill switch: on", "Watchdog: running" | auto-connect at work on an untrusted network: wait for the tunnel. A login page needed first? `vpn off` releases this network until you change network; log in, then `vpn on` |
 | `vpn status` says the kill switch is NOT LOADED | `systemctl status vpn-killswitch`; `sudo nft list tables` | `sudo systemctl start vpn-killswitch`, or `sudo -n /usr/local/bin/vpn-root status`, which reloads it. It loads at boot only once a profile exists |
 | Connected, DNS resolves, pages hang | `journalctl -u NetworkManager -n 50 \| grep -i EMSGSIZE` | path MTU below 1400: `nmcli con mod <name> +vpn.data "mssfix=1300, tunnel-mtu=1300"`, reconnect |
-| `vpn on` says the kill switch could not be armed | `sudo -n /usr/local/bin/vpn-root status` fails with "a password is required"? | sudoers rule missing (an installation that stopped half way removes it until it completes): `sudo /usr/local/lib/tun0-vpn/install.sh` |
+| `vpn on` says the kill switch could not be armed | `sudo -n /usr/local/bin/vpn-root status` fails with "a password is required"? | sudoers rule missing (an installation that stopped half way removes it until it completes): paste the bootstrap from [Install](#install) again |
 | Watchdog retries forever | `journalctl -u NetworkManager -n 30` during an attempt | auth failure (password changed?): `vpn remove` every profile of that provider (the credentials go with the last one), then `vpn add` asks for them again; or the provider rotated its servers: fetch a fresh `.ovpn` |
 | Handshake fails while the kill switch is up | `sudo nft list set inet vpn_ks endpoints_udp \| grep <IP from the .ovpn>` (`endpoints_tcp` for a TCP config): the address with the port the config names | provider changed servers: `vpn remove <name>`, then `vpn add <new file>` |
-| `install.sh` refuses to run | the first line of its message | from the plugin folder or a clone of your own: follow [Install](#install). "must belong to root": the release was cloned without `sudo`, or changed; remove `/usr/local/lib/tun0-vpn` and clone it again. "not signed" or "different release key": do not install; compare with the README on GitHub. "not installed:": install the packages it names. "not put there by tun0 VPN": a file of your own or of another package has that name; move it away if it may be replaced |
-| `vpn on` fails with "a password is required" right after you edited `/usr/local/bin/vpn-root` | the rule names the SHA-256 of the installed helper | on purpose: sudo runs only the bytes the release installed. `sudo /usr/local/lib/tun0-vpn/install.sh` puts them back |
+| `install.sh` refuses to run, or the bootstrap stops | the last line of its output | the bootstrap stops at the first check that fails and runs nothing of the release. "placeholders": copy it from the README at the verified commit. "writable by others than root": fix the owner or mode of the directory it names. "K is not the release key pinned": do not install; compare `K` with the README at the verified commit and the account's signing keys. "verify-commit" failing, or `sha256sum` reporting FAILED: the commit or its files are not the release named in the README, so do not install. A bootstrap that stopped leaves the installed tun0 VPN working (the `vpn` command, the helper, the kill switch and `vpn-uninstall` do not use `/usr/local/lib/tun0-vpn`). `install.sh` started by hand, or from the plugin folder: paste the bootstrap instead. "must belong to root": remove `/usr/local/lib/tun0-vpn` and paste the bootstrap again. "different release key": do not install; compare with the README and the account's signing keys. "not installed:": install the packages it names. "not put there by tun0 VPN": a file of your own or of another package has that name; move it away if it may be replaced |
+| `vpn on` fails with "a password is required" right after you edited `/usr/local/bin/vpn-root` | the rule names the SHA-256 of the installed helper | on purpose: sudo runs only the bytes the release installed. Pasting the bootstrap again puts them back |
 | Connected but the IP is still yours | `ip route show default`: first line must be `tun0` | `nmcli con mod <name> ipv4.never-default no` |
 | `status` says `!! Expected de, seen ch` | `ip route get 1.1.1.1` goes through `tun0`? | then ipinfo merely maps that IP to a different country; cross-check by hand with another service |
-| `vpn` stops working after `omarchy update` or `omarchy refresh` | `ls -la /usr/local/bin/vpn-root /etc/sudoers.d/vpn /etc/NetworkManager/dispatcher.d/90-vpn-killswitch` | those survive updates. If they are there, the plugin was disabled (`omarchy plugin enable rogertobler.tun0-vpn`, or `sudo /usr/local/lib/tun0-vpn/install.sh`) |
+| `vpn` stops working after `omarchy update` or `omarchy refresh` | `ls -la /usr/local/bin/vpn-root /etc/sudoers.d/vpn /etc/NetworkManager/dispatcher.d/90-vpn-killswitch` | those survive updates. If they are there, the plugin was disabled (`omarchy plugin enable rogertobler.tun0-vpn`, or paste the bootstrap from [Install](#install) again) |
 | Icon missing from the bar | `python3 -m json.tool ~/.config/omarchy/shell.json` | `omarchy plugin enable rogertobler.tun0-vpn`, then `omarchy restart shell` |
 | The shell crashed right after `install.sh`, `omarchy plugin add`, or an edit in the plugin folder, while the screen was locked | `journalctl --user -n 200 \| grep -A2 'Local plugin changed'` shows `lock-stranded: recovering` and `FATAL: Tried to show lockscreen surfaces without active lock` | not the widget: Omarchy 4.0.2's shell re-takes its own session lock on a hot reload. Unlock first, then install or edit; `install.sh` refuses to run while the screen is locked. Recovery: switch to a TTY (`Ctrl+Alt+F3`), log in, `omarchy restart shell`, or reboot |
 
@@ -489,7 +535,7 @@ same actions.
 Used daily on Omarchy 4.0.x (NetworkManager 1.58, nftables 1.1.6, gum 2.0, Quickshell). The widget is a regular
 `bar-widget` plugin; the kill switch is what the store model cannot install by itself, hence `install.sh`.
 
-Plugin id `rogertobler.tun0-vpn` · display name **tun0 VPN** · command `vpn` · version **1.1.0**, see
+Plugin id `rogertobler.tun0-vpn` · display name **tun0 VPN** · command `vpn` · version **1.1.1**, see
 [CHANGELOG.md](CHANGELOG.md).
 
 ## License

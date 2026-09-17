@@ -4,12 +4,12 @@
 # NetworkManager waits for a script: before it declares an interface usable, and before it takes one down.
 # So the kill switch decision lands before the first packet of a network, also before login, and an interface
 # is shut again before it can carry the next network's first packet.
-#   pre-up | up          an ordinary interface (Wi-Fi, wired): vpn-root applies the policy - open it in the kill
+#   pre-up | up          an ordinary interface (Wi-Fi, wired): vpn-root applies the policy: open it in the kill
 #                        switch if the network is trusted or wired, keep it shut if a VPN is wanted or the Wi-Fi is
 #                        untrusted with auto-connect on. `up` also starts the tunnel when one is wanted.
 #   pre-down | down      the interface is shut again, whatever NetworkManager still lists for it
 #   vpn-up               a tunnel came up: marker, uplinks shut (belt and braces, in case it was not started via `vpn on`)
-#   vpn-down             do NOT clean up - NetworkManager reports vpn-down for a drop as well as for an intended
+#   vpn-down             do NOT clean up: NetworkManager reports vpn-down for a drop as well as for an intended
 #                        disconnect. If the marker is there (= the user wanted a VPN), start the reconnect watchdog.
 #                        Only `vpn off` lifts it.
 export PATH=/usr/bin   # runs as root: its tools by a fixed path only, whatever the environment it was started with
@@ -29,7 +29,7 @@ case "$2" in
   vpn-down)
     managed || exit 0
     if [[ -e /run/vpn-killswitch.active ]]; then
-      logger -t vpn-root "${CONNECTION_ID:-VPN} down - uplinks stay shut, starting watchdog"
+      logger -t vpn-root "${CONNECTION_ID:-VPN} down, uplinks stay shut, starting watchdog"
       "$ROOT" watch
     fi
     ;;

@@ -119,7 +119,7 @@ Item {
     var d = Model.parseState(raw)
     loading = false
     if (!d) {
-      stateFailed("`vpn json` did not return a state - is tun0 VPN installed? See Install in the README")
+      stateFailed("`vpn json` did not return a state. Is tun0 VPN installed? See Install in the README")
       return
     }
     failed = false
@@ -222,7 +222,7 @@ Item {
     onStarted: { root._stateText = ""; root._overflow._stateText = false }
     onExited: function(exitCode) {
       if (root._overflow._stateText) root.stateFailed("`vpn json` said more than " + root.outputCap + " characters and was stopped")
-      else if (exitCode !== 0) root.stateFailed("`vpn json` failed (exit " + exitCode + (exitCode === 124 ? ", timed out" : "") + ") - is tun0 VPN installed? See Install in the README")
+      else if (exitCode !== 0) root.stateFailed("`vpn json` failed (exit " + exitCode + (exitCode === 124 ? ", timed out" : "") + "). Is tun0 VPN installed? See Install in the README")
       else root.applyState(root._stateText)
       root._stateText = ""
     }

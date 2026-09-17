@@ -1,6 +1,6 @@
 #!/bin/bash
-# tun0 VPN: removes everything install.sh put on the system, including the release in /usr/local/lib/tun0-vpn and
-# vpn-update. Profiles, configs, credentials, the pinned release key and the installed-release record are removed too
+# tun0 VPN: removes everything install.sh put on the system, including the release in /usr/local/lib/tun0-vpn and the
+# vpn-update an earlier release installed. Profiles, configs, credentials, the pinned release key and the installed-release record are removed too
 # unless you pass --keep-profiles (then /etc/vpn, without the record of the installed release, and the NetworkManager
 # profiles stay).
 #

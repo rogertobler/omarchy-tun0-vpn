@@ -8,7 +8,7 @@
 #   vpn status             state + public IP + country/city/provider as seen by ipinfo.io
 #   vpn list               profiles (* active, = default)
 #   vpn default [NAME]     show / set the default (/etc/vpn/settings, written through vpn-root)
-#   vpn add [FILE]         add a profile - gum wizard (file / clipboard / path, name, credentials); from the menu in a floating terminal
+#   vpn add [FILE]         add a profile with a gum wizard (file / clipboard / path, name, credentials); from the menu in a floating terminal
 #   vpn remove [NAME]      remove a profile (without NAME: pick from menu)
 #   vpn killswitch [on|off|toggle]   show / set the kill switch setting (default on; off = VPN without blocking, e.g. for LAN printers)
 #   vpn trust [add|remove|edit] [SSID]   trusted Wi-Fi networks (default: the one you are on; edit = TUI); vpn autoconnect|autodisconnect [on|off|toggle]
@@ -48,7 +48,7 @@ ks()       { /usr/bin/sudo -n "$KS" "$@"; }   # both by absolute path: the cross
 ks_setting() { user_setting killswitch; }   # empty = on
 uplink() { nmcli -t -f TYPE,DEVICE con show --active 2>/dev/null | awk -F: '$1!="vpn" && $1!="loopback" && $1!="tun" && $2!="" {print $2; exit}'; }
 # on = the uplink is shut and only the tunnel may carry traffic (a VPN is wanted, or untrusted Wi-Fi with auto-connect on);
-# off = the uplink is open; disabled = the setting is off, no table. Read from root's state file - no sudo on a poll.
+# off = the uplink is open; disabled = the setting is off, no table. Read from root's state file, so a poll needs no sudo.
 # unloaded = the setting is on but no table is loaded (no profile yet, or the unit was stopped): nothing is blocked.
 ks_state() {
   local up
@@ -57,7 +57,7 @@ ks_state() {
   else up=$(uplink); if [[ -n "$up" ]] && ! grep -qxF -- "$up" "$OPEN_FILE" 2>/dev/null; then echo "on"; else echo "off"; fi; fi
 }
 # notify [-u urgency] HEADLINE [TEXT] [--exec CMD ARGS...]  -> Omarchy-styled toast, optional action button
-# VPN_QUIET=1 (set by the panel while it is open) drops the normal toasts - the panel shows the result
+# VPN_QUIET=1 (set by the panel while it is open) drops the normal toasts; the panel shows the result
 # itself, a toast on top of it only covers it. Critical ones still get through: they report a state the
 # panel cannot show (rules failed to load, kill switch stuck) and may arrive after the panel is closed.
 notify() {
@@ -66,12 +66,12 @@ notify() {
   omarchy-notification-send --app-name VPN -g "󰦝" -u "$u" "$@" 2>/dev/null || true
 }
 die_unknown() { echo "Unknown: '$1'. Available: $(connections | paste -sd' ')" >&2; exit 1; }
-# Visible error inside the gum wizards - a plain echo scrolls past unnoticed between the styled prompts.
+# Visible error inside the gum wizards: a plain echo scrolls past unnoticed between the styled prompts.
 err() { gum style --foreground 1 "$*" 2>/dev/null || printf '%s\n' "$*" >&2; }
 
 # The wizards run in a floating terminal. Omarchy's own wrapper prints the Omarchy logo there;
 # this is the plugin's window, so it prints the plugin's name in the same block font (figlet
-# "Delta Corps Priest 1", the family of Omarchy's logo.txt - the font has no digits, the zero is
+# "Delta Corps Priest 1", the family of Omarchy's logo.txt; the font has no digits, the zero is
 # drawn by hand). Green through the plain ANSI code, so it follows the terminal theme like Omarchy's.
 logo() {
   clear
@@ -114,8 +114,8 @@ active()      { nmcli -t -f NAME,TYPE,STATE con show --active 2>/dev/null | awk 
 # and persist-tun keeps the routes, so nothing flows and nothing complains. The journal is the only witness:
 # a restart line after the last "Initialization Sequence Completed" within the last three minutes. ~20 ms.
 # Also stalled: the uplink has lost its link. NetworkManager keeps the Wi-Fi "activated" for its 15 s link
-# timeout and the persistent tunnel keeps tun0, so nothing else would tell for a quarter of a minute
-# (09.09. 21:37, hotspot switched off: the panel said "connected" until NM gave up). The kernel knows at once.
+# timeout and the persistent tunnel keeps tun0, so nothing else would tell for a quarter of a minute (with a hotspot
+# switched off, the panel said "connected" until NetworkManager gave up). The kernel knows at once.
 stalled() {
   local up; up=$(uplink)
   [[ -n "$up" ]] || return 0                                              # a tunnel with no uplink at all
@@ -127,7 +127,7 @@ stalled() {
 }
 live()        { nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="vpn"{print $1}' | grep -xF -f <(connections) 2>/dev/null || true; }   # ours, activated or activating
 # Connections are brought up and down by UUID, never by name: another connection (a Wi-Fi called proton-ch) may carry
-# the same name (review of the marketplace, #4243).
+# the same name.
 vpn_uuid()    { nmcli -t -f NAME,UUID,TYPE con show 2>/dev/null | awk -F: -v n="$1" '$1 == n && $3 == "vpn" {print $2; exit}'; }
 down_live() {   # [KEEP]: bring our active tunnels down by UUID, except the one named KEEP
   local n u t mine
@@ -194,9 +194,9 @@ known_wifi() {
 # for as long as they stay on it. Skipped when the action came from `auto` itself.
 auto() {
   # Called by every bar poll (`json`, and `indicator` for a command module). The trusted-network policy itself
-  # runs as root, in the dispatcher, at pre-up - before the first packet and before login. This only turns its
-  # last automatic decision into a toast, once. Until 9 September the decision was made here, on the poll,
-  # which left up to 5 s plus the handshake open on every untrusted network; see README, "Why the kill switch".
+  # runs as root, in the dispatcher, at pre-up, before the first packet and before login. This only turns its
+  # last automatic decision into a toast, once. Making the decision here, on the poll, would leave up to 5 s plus
+  # the handshake open on every untrusted network; see README, "Why the kill switch".
   local ts kind ssid name
   [[ -r "$EVENT_FILE" ]] || return 0
   IFS=$'\t' read -r ts kind ssid name < "$EVENT_FILE" || true
@@ -208,8 +208,8 @@ auto() {
   echo "$ts" > "$AUTO_STATE" 2>/dev/null || true
   case "$kind" in
     connect)    notify "VPN auto-connect" "Untrusted Wi-Fi \"$ssid\": network shut, $( [[ -n "$(active)" ]] && echo connected || echo connecting) $(label "$name") ($name). Click to trust this network." --exec "$SELF" trust add "$ssid" ;;
-    disconnect) notify "VPN disconnected" "Trusted Wi-Fi \"$ssid\" - kill switch released" ;;
-    noprofile)  notify -u critical "VPN: auto-connect has nothing to connect" "Untrusted Wi-Fi \"$ssid\", but no profile is set up - the network is left OPEN. Add a profile, or turn auto-connect off." ;;
+    disconnect) notify "VPN disconnected" "Trusted Wi-Fi \"$ssid\", kill switch released" ;;
+    noprofile)  notify -u critical "VPN: auto-connect has nothing to connect" "Untrusted Wi-Fi \"$ssid\", but no profile is set up, so the network is left OPEN. Add a profile, or turn auto-connect off." ;;
   esac
 }
 # The widget and the toasts show SSIDs cleaned of control and direction characters and cut to 64 bytes, and hand back
@@ -240,18 +240,18 @@ trust() {
       echo "Auto-disconnect on trusted Wi-Fi: $(v=$(user_setting autodisconnect); echo "${v:-off}")" ;;
     add)
       [[ -n "$ssid" ]] || { echo "Not on Wi-Fi and no SSID given." >&2; exit 1; }
-      is_trusted "$ssid" || ks trust add "$ssid" || { echo "Could not write the trusted list (sudo -n $KS trust add - sudoers?)" >&2; exit 1; }
+      is_trusted "$ssid" || ks trust add "$ssid" || { echo "Could not write the trusted list (sudo -n $KS trust add failed; is the sudoers rule there?)" >&2; exit 1; }
       menu_write >/dev/null; notify "VPN" "\"$ssid\" is now a trusted network" ;;
     remove)
       [[ -n "$ssid" ]] || { echo "Not on Wi-Fi and no SSID given." >&2; exit 1; }
-      ks trust remove "$ssid" || { echo "Could not write the trusted list (sudo -n $KS trust remove - sudoers?)" >&2; exit 1; }
+      ks trust remove "$ssid" || { echo "Could not write the trusted list (sudo -n $KS trust remove failed; is the sudoers rule there?)" >&2; exit 1; }
       menu_write >/dev/null; notify "VPN" "\"$ssid\" is no longer trusted" ;;
     toggle)
       if is_trusted "$ssid"; then trust remove "$ssid"; else trust add "$ssid"; fi ;;
     edit)
       # The whole list at once, for people with a hundred saved networks. fzf, because its keys can be chosen:
       # space or tab marks, enter saves, typing searches, ctrl-c leaves everything as it is. (gum filter keeps
-      # its search box focused, so space typed a space and emptied the list - the wrong thing to happen on the
+      # its search box focused, so space typed a space and emptied the list, the wrong thing to happen on the
       # key everyone reaches for.) Every trusted name is in the offered set (known_wifi unions the file), so
       # what comes back is the new list. Trusted rows start marked: fzf has no preselect flag, so the load
       # event walks to each of them and toggles.
@@ -264,7 +264,7 @@ trust() {
       gum style --faint "space or tab marks a network as trusted · enter saves · type to search · ctrl-c leaves everything as it is${cur:+ · you are on \"$cur\"}"
       sel=$(printf '%s\n' "$list" | fzf --multi --layout=reverse --height=~18 --info=hidden --no-sort \
               --prompt='  ' --pointer='›' --marker='◉' --bind 'space:toggle,tab:toggle' --bind "load:${pre#+}${pre:++first}") || { echo "Unchanged."; exit 0; }
-      printf '%s\n' "$sel" | ks trust set || { echo "Could not write the trusted list (sudo -n $KS trust set - sudoers?)" >&2; exit 1; }
+      printf '%s\n' "$sel" | ks trust set || { echo "Could not write the trusted list (sudo -n $KS trust set failed; is the sudoers rule there?)" >&2; exit 1; }
       count=$(grep -c . "$TRUSTED_FILE" || true)
       menu_write >/dev/null; notify "VPN" "$count trusted network$( [[ $count == 1 ]] || echo s)"
       echo "Trusted now: $(clean "$(paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g')" 2048)" ;;
@@ -301,7 +301,7 @@ json_state() {
   elif [[ -n "$pending" || -e "$MARK" ]]; then state=connecting; want=${pending:-$(cat "$MARK" 2>/dev/null)}
   else state=off; want=""; fi
   iface=""; rx=0; tx=0
-  if [[ -n "$cur" ]]; then   # counters also while stalled - a flat sparkline is part of the picture
+  if [[ -n "$cur" ]]; then   # counters also while stalled: a flat sparkline is part of the picture
     # NetworkManager lists the parent device (the Wi-Fi card) for a VPN connection; the tunnel's own counters live
     # on the tun interface that carries the connection's address. Fall back to the first tun*, then to NM's answer.
     local addr; addr=$(nmcli -g IP4.ADDRESS con show "$cur" 2>/dev/null | head -1); addr=${addr%%/*}
@@ -312,7 +312,7 @@ json_state() {
   fi
   rec=$(recent)
   # Built by jq, not by printf: every string is encoded properly, network-derived ones are cleaned and capped, and
-  # the lists are bounded (review of the marketplace, 16.09.2026).
+  # the lists are bounded.
   local profiles="" n
   while read -r n; do
     [[ -n "$n" ]] || continue
@@ -361,7 +361,7 @@ ipinfo() {
 }
 public_ip() {
   # Where does the traffic really come out? Slow (a round trip to ipinfo.io), so the widget asks only when
-  # the panel opens or the state changes. Empty fields when offline, blocked or turned off - never an error.
+  # the panel opens or the state changes. Empty fields when offline, blocked or turned off, never an error.
   local info
   if ! lookup_on; then echo '{"ip":"","country":"","city":"","org":"","lookup":false}'; return 0; fi
   info=$(ipinfo)
@@ -372,14 +372,14 @@ status() {
   local kss cur def
   kss=$(ks_state); cur=$(active); def=$(default_con)
   if [[ -n "$cur" ]]; then
-    if stalled; then printf 'VPN:         STALLED - %s (%s): the uplink lost its link or the server is not answering; OpenVPN is restarting. Nothing flows until it is back.\n' "$(label "$cur")" "$cur"
+    if stalled; then printf 'VPN:         STALLED on %s (%s): the uplink lost its link or the server is not answering; OpenVPN is restarting. Nothing flows until it is back.\n' "$(label "$cur")" "$cur"
     else printf 'VPN:         connected, %s (%s)\n' "$(label "$cur")" "$cur"; fi
   else                     printf 'VPN:         disconnected (default: %s)\n' "${def:-none}"; fi
-  if [[ "$kss" == on ]] && ! ks status >/dev/null 2>&1; then kss="state file says shut, but root disagrees or the table is gone - sudo -n $KS status reloads it"; fi
+  if [[ "$kss" == on ]] && ! ks status >/dev/null 2>&1; then kss="state file says shut, but root disagrees or the table is gone; sudo -n $KS status reloads it"; fi
   case "$kss" in
-    on)       printf 'Kill switch: on - uplink shut, only the tunnel may carry traffic\n' ;;
-    off)      printf 'Kill switch: off - uplink open, table loaded\n' ;;
-    unloaded) printf 'Kill switch: NOT LOADED - nothing is blocked%s (no profile yet? unit stopped? sudo systemctl start vpn-killswitch)\n' "$( [[ -e "$MARK" ]] && echo ", although a VPN is wanted")" ;;
+    on)       printf 'Kill switch: on (uplink shut, only the tunnel may carry traffic)\n' ;;
+    off)      printf 'Kill switch: off (uplink open, table loaded)\n' ;;
+    unloaded) printf 'Kill switch: NOT LOADED, nothing is blocked%s (no profile yet? unit stopped? sudo systemctl start vpn-killswitch)\n' "$( [[ -e "$MARK" ]] && echo ", although a VPN is wanted")" ;;
     *)        printf 'Kill switch: %s\n' "$kss" ;;
   esac
   local ssid; ssid=$(current_ssid)
@@ -390,7 +390,7 @@ status() {
     echo
   fi
   systemctl is-active -q vpn-reconnect.service 2>/dev/null && printf 'Watchdog:    running, wants %s\n' "$(cat "$MARK" 2>/dev/null)"
-  if [[ -n "$ssid" && "$(cat /run/vpn-killswitch.manual 2>/dev/null)" == "$ssid" ]]; then printf 'Manual:      you switched the VPN by hand on this network - auto-connect/-disconnect pause here until you change network (a trust or automation change lifts this)\n'; fi
+  if [[ -n "$ssid" && "$(cat /run/vpn-killswitch.manual 2>/dev/null)" == "$ssid" ]]; then printf 'Manual:      you switched the VPN by hand on this network, so auto-connect/-disconnect pause here until you change network (a trust or automation change lifts this)\n'; fi
   if [[ "${1:-}" == "--ip" ]]; then
     # Cross-check from outside: where does the traffic really exit? (ipinfo.io, ~1000 requests/day without a key)
     local info ip country city org
@@ -405,7 +405,7 @@ status() {
       printf 'Public IP:   %s\n' "$ip"
       printf 'Seen as:     %s (%s)%s%s\n' "$(country_name "$country")" "$country" "${city:+, $city}" "${org:+ · $org}"
       if [[ -n "$cur" && "${country,,}" != "${cur##*-}" ]]; then
-        echo "!! Expected ${cur##*-}, seen ${country,,} - traffic is NOT going through the tunnel (or ipinfo maps the IP differently)"
+        echo "!! Expected ${cur##*-}, seen ${country,,}: traffic is NOT going through the tunnel (or ipinfo maps the IP differently)"
       fi
     elif lookup_on; then
       printf 'Public IP:   unreachable\n'
@@ -425,20 +425,21 @@ connect() {
   else
     name=$(cat "$MARK" 2>/dev/null || true)          # a pending reconnect target wins over the default
     connections | grep -qx "${name:-/}" || name=$(default_con)
-    [[ -n "$name" ]] || { echo "No VPN profile yet - run: vpn add" >&2; exit 1; }
+    [[ -n "$name" ]] || { echo "No VPN profile yet. Run: vpn add" >&2; exit 1; }
   fi
   cur=$(active)
   if [[ "$cur" == "$name" ]]; then echo "Already connected: $name"; status --ip; return 0; fi
-  # `arm` writes the marker and shuts the uplink at once - before the handshake, not after it. The handshake is
+  # `arm` writes the marker and shuts the uplink at once, before the handshake and not after it. The handshake is
   # allowed by IP (the endpoints set), so nothing else leaves the machine while the tunnel is negotiated; the
-  # watchdog has connected through a shut uplink on every reconnect since 8 September. Arming never opens
-  # anything, so switching away from a running tunnel stays leak-free. What must not happen is a second attempt
-  # while the first is still negotiating (08.09. 14:26: two racing connects, 33 s dark) - see "Superseded" below.
+  # watchdog connects through a shut uplink the same way on every reconnect. Arming never opens anything, so
+  # switching away from a running tunnel stays leak-free. What must not happen is a second attempt while the first is
+  # still negotiating: two racing connects leave the machine without network. See "Superseded" below.
   ks arm "$name" \
-    || { echo "Could not arm the kill switch (sudoers? /etc/vpn/killswitch.nft? -> sudo /usr/local/lib/tun0-vpn/install.sh)" >&2; exit 1; }
-  # Switching: bring the old profile(s) down first - activated or still activating; the kill switch stays up meanwhile.
+    || { echo "Could not arm the kill switch. Is the sudoers rule there, and /etc/vpn/killswitch.nft? Pasting the bootstrap from the README again restores both." >&2; exit 1; }
+  # Switching: bring the old profile(s) down first, activated or still activating; the kill switch stays up meanwhile.
   # Then stop the watchdog: the old profile's vpn-down starts one (marker present), and a watchdog racing our own
-  # `nmcli con up` was the 08.09. blackout; stopping it before the down would only let vpn-down start a fresh one.
+  # `nmcli con up` leaves the machine without network; stopping it before the down would only let vpn-down start a
+  # fresh one.
   down_live "$name"
   ks unwatch
   uuid=$(vpn_uuid "$name")
@@ -447,7 +448,7 @@ connect() {
     if ks on "$name"; then   # belt and braces; normally already done by the dispatcher
       notify "VPN connected" "$(label "$name") ($name), kill switch $(ks_state)"
     else
-      notify -u critical "VPN connected WITHOUT kill switch" "rules could not be loaded - see: sudo -n $KS on $name" --exec "$SELF" off
+      notify -u critical "VPN connected WITHOUT kill switch" "rules could not be loaded, see: sudo -n $KS on $name" --exec "$SELF" off
     fi
     status --ip
   else
@@ -473,8 +474,8 @@ disconnect() {
   ks off || ok=0   # first: without the marker the dispatcher knows this disconnect is intended; also opens the uplink
   down_live   # activated AND activating ones
   if (( ok )); then
-    notify "VPN disconnected" "Network released - open until you change network"
-  else notify -u critical "VPN: could not remove the kill switch" "sudo -n $KS off failed - check /etc/sudoers.d/vpn"; fi
+    notify "VPN disconnected" "Network released until you change network"
+  else notify -u critical "VPN: could not remove the kill switch" "sudo -n $KS off failed; check /etc/sudoers.d/vpn"; fi
   status
   (( ok ))
 }
@@ -483,7 +484,7 @@ indicator() {
   # Waybar-style JSON for the Omarchy bar command module (polled every 5 s).
   # A command module knows only two colours: "inactive" = bar foreground, "active" = the theme's
   # urgent colour (Ui/WidgetButton.qml: activeColor = bar.urgent = theme red). Red is therefore
-  # reserved for "something is wrong" - no tunnel and nobody about to fix it. Connected is the
+  # reserved for "something is wrong": no tunnel and nobody about to fix it. Connected is the
   # normal state and keeps the foreground colour; the filled shield plus the profile name say so.
   auto   # the toast for the dispatcher's last decision rides on this poll; returns at once when there is none
   local kss cur pending want wd
@@ -491,20 +492,20 @@ indicator() {
   systemctl is-active -q vpn-reconnect.service 2>/dev/null && wd=1 || wd=""
   pending=$(live | head -1)
   if [[ -n "$cur" ]] && stalled; then
-    printf '{"text":"\U000F099E %s","tooltip":"Tunnel stalled - OpenVPN is restarting, %s is not answering. Nothing flows until it is back.\\nClick: disconnect · Right-click: menu","class":"active"}\n' "$cur" "$cur"
+    printf '{"text":"\U000F099E %s","tooltip":"Tunnel stalled: OpenVPN is restarting, %s is not answering. Nothing flows until it is back.\\nClick: disconnect · Right-click: menu","class":"active"}\n' "$cur" "$cur"
   elif [[ -n "$cur" ]]; then
     printf '{"text":"\U000F099D %s","tooltip":"%s (%s), kill switch %s\\nClick: disconnect · Right-click: menu","class":"inactive"}\n' "$cur" "$(label "$cur")" "$cur" "$kss"
   elif [[ -n "$wd" ]]; then
     # The watchdog only runs after NetworkManager gave up: this is the alarm state. It is checked
     # before "connecting", or every retry of the watchdog would blink the alarm away for one poll.
     if [[ "$kss" == "disabled" ]]; then
-      printf '{"text":"\U000F099E","tooltip":"VPN down, kill switch DISABLED - traffic bypasses the tunnel, watchdog is reconnecting\\nClick: reconnect · Right-click: menu","class":"active"}\n'
+      printf '{"text":"\U000F099E","tooltip":"VPN down, kill switch DISABLED: traffic bypasses the tunnel, watchdog is reconnecting\\nClick: reconnect · Right-click: menu","class":"active"}\n'
     else
       printf '{"text":"\U000F099E","tooltip":"VPN down, kill switch is blocking, watchdog is reconnecting\\nClick: reconnect · Right-click: menu / release","class":"active"}\n'
     fi
   elif [[ -n "$pending" || -e "$MARK" ]]; then
     # Connecting: nmcli is negotiating, or "vpn on" has armed the marker and has not reached nmcli
-    # yet. The user asked for this a moment ago - it is not an alarm, so it is not the urgent colour.
+    # yet. The user asked for this a moment ago; it is not an alarm, so it is not the urgent colour.
     # Outline shield (not protected yet) plus the name and an ellipsis, so it reads as in progress.
     want=${pending:-$(cat "$MARK" 2>/dev/null)}
     printf '{"text":"\U000F0484 %s…","tooltip":"Connecting to %s (%s), kill switch armed\\nClick: cancel · Right-click: menu","class":"inactive"}\n' "$want" "$(label "$want")" "$want"
@@ -569,7 +570,7 @@ add() {
   while :; do                                  # name: ask again on a typo or a collision, pre-filled with what was typed
     name=$(gum input --header "Profile name as provider-country (Enter keeps the suggestion)" --value "$guess" --placeholder "proton-ch") || { echo "Cancelled."; exit 1; }
     name=${name,,}; name=${name// /-}; guess=$name
-    [[ "$name" =~ ^[a-z0-9]+-[a-z0-9]+$ ]] || { err "Name must be provider-country: exactly one dash, letters and digits only - proton-ch, mullvad-se. Got: ${name:-<empty>}"; continue; }
+    [[ "$name" =~ ^[a-z0-9]+-[a-z0-9]+$ ]] || { err "Name must be provider-country: exactly one dash, letters and digits only (proton-ch, mullvad-se). Got: ${name:-<empty>}"; continue; }
     nmcli -t -f NAME con show 2>/dev/null | grep -qxF "$name" && { err "A connection named '$name' already exists. Choose another name, or remove that one first: vpn remove $name"; continue; }
     break
   done
@@ -593,7 +594,7 @@ add() {
   fi
   if out=$(ks add "$name" < "$f" 2>&1); then
     unset _cons
-    # the first profile becomes the default - vpn-root add does that
+    # the first profile becomes the default (vpn-root add does that)
     menu_write >/dev/null
     [[ -n "${tmp:-}" ]] && rm -f "$tmp"
     notify "VPN added" "$(label "$name") ($name)"; echo "$out"; echo; gum style --bold "Done: vpn on $name"
@@ -668,7 +669,7 @@ menu_write() {
 import os, re, sys
 path = sys.argv[1]; block = os.environ["BLOCK"]
 s = open(path).read()
-s = re.sub(r"[ \t]*// >>> protonvpn.*?// <<< protonvpn[ \t]*\n?", "", s, count=1, flags=re.S)   # alter Block (bis 08.09.2026)
+s = re.sub(r"[ \t]*// >>> protonvpn.*?// <<< protonvpn[ \t]*\n?", "", s, count=1, flags=re.S)   # the block written by versions before 1.0.0
 pat = re.compile(r"[ \t]*// >>> vpn.*?// <<< vpn[ \t]*\n?", re.S)
 if pat.search(s):
     s = pat.sub(lambda m: block + "\n", s, count=1)   # a function: re.sub would otherwise eat the backslashes in the block
@@ -692,7 +693,7 @@ version() {
     v=$(manifest_version "$m")
     [[ -n "$v" ]] || continue
     printf 'tun0 VPN %s\n' "$v"
-    # The root side is updated on its own (vpn-update), so the two can differ; say so rather than guess.
+    # The root side is updated on its own (the bootstrap in the README), so the two can differ; say so rather than guess.
     local rv; rv=$(cut -d' ' -f1 /etc/vpn/installed-release 2>/dev/null || true)
     if [[ -z "$rv" ]]; then echo "note: no release of the root side is recorded (/etc/vpn/installed-release); see Install in the README" >&2
     elif [[ "$rv" != "$v" ]]; then echo "note: the widget is $v, the root side is $rv" >&2; fi
@@ -711,7 +712,7 @@ version() {
 case "${1:-status}" in
   on|up)        connect "${2:-}" ;;
   off|down)     disconnect ;;
-  # A click while a connect is still negotiating cancels it - what the icon tooltip promises - instead of
+  # A click while a connect is still negotiating cancels it, as the icon tooltip promises, instead of
   # starting a second, racing attempt. Hence live (activated OR activating), not active.
   toggle)       # "wanted" (marker) or already negotiating -> off; the marker closes the gap between `ks arm`
                 # and the first moment NM lists the profile as activating, so a double click cannot start two connects

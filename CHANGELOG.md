@@ -3,9 +3,33 @@
 All notable changes to tun0 VPN are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The version in `manifest.json` is the single source of truth. Every release is one commit on `main`, tagged
-`vX.Y.Z`, with a GitHub release carrying the section below. Between releases `main` stands still, because the
-Omarchy marketplace pins a listing to an exact commit.
+The version in `manifest.json` is the single source of truth. Since 1.1.1 every release is two signed commits on `main`:
+the release commit, tagged `vX.Y.Z`, and on top of it a commit that only writes that commit's hash and the digest of its
+`SHA256SUMS` into the README. A GitHub release carries the section below. Between releases `main` stands still, because
+the Omarchy marketplace pins a listing to an exact commit.
+
+## [1.1.1] 2026-09-17
+
+The root side is installed and updated by a bootstrap that checks a release before any of it runs. The installation
+and update commands change; see Install and Update in the README.
+
+### Security
+
+* Installing no longer clones a tag and starts its `install.sh`, which checked the release only once it was already
+  running as root. A bootstrap pasted from the README, running as root with an empty environment and full paths,
+  fetches exactly one release commit by its full hash into an empty repository, checks that the commit is signed by
+  the release key and that its `SHA256SUMS` has the digest the README names, and only then checks the files out,
+  checks each against `SHA256SUMS` and starts `install.sh --commit` (marketplace security review).
+* Before it touches anything the bootstrap refuses placeholder values, a directory above `/usr/local/lib/tun0-vpn`
+  that anyone but root can write to, and, on an update, a key other than the pinned one. It and `install.sh` let only
+  `ssh-keygen` check a signature: an OpenPGP or X.509 signature is refused instead of going to gpg.
+* `SHA256SUMS` lists `install.sh` too.
+* `install.sh` requires `--commit`, checks that the checkout is exactly that commit, unmodified, and that the commit is
+  signed by the release key; it no longer depends on a tag or on how the clone was made.
+* `vpn-update` is gone: it accepted any release the key signed. An update is the bootstrap with the values of the newer
+  release. `install.sh` removes the `vpn-update` of 1.1.0.
+* Each release is two commits: the signed release commit with its tag, and a signed commit that only writes that
+  commit's hash and the digest of its `SHA256SUMS` into the README.
 
 ## [1.1.0] 2026-09-17
 
@@ -173,5 +197,6 @@ First public release. Built and used daily on Omarchy 4.0.2 since 8 September 20
 * The installer refuses to run while the screen is locked, because writing into the live plugin folder makes the
   shell hot reload and Omarchy 4.0.2 crashes when that happens under an active lock.
 
+[1.1.1]: https://github.com/rogertobler/omarchy-tun0-vpn/releases/tag/v1.1.1
 [1.1.0]: https://github.com/rogertobler/omarchy-tun0-vpn/releases/tag/v1.1.0
 [1.0.0]: https://github.com/rogertobler/omarchy-tun0-vpn/releases/tag/v1.0.0

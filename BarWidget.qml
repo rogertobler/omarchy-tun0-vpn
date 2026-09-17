@@ -36,7 +36,7 @@ Panel {
   readonly property color selectedFill: Style.selectedFillFor(foreground, accent)
   readonly property color hoverFill: Style.hoverFillFor(foreground, accent)
 
-  // A list row without a switch. The panel has exactly one switch that matters - the one in the hero -
+  // A list row without a switch. The panel has exactly one switch that matters (the one in the hero)
   // and two settings switches; everything else is a choice (profiles: one is active) or a mark (Wi-Fi:
   // trusted or not, kill switch: what it is doing). Rows carry a glyph or a word on the right instead,
   // the way Omarchy's own Wi-Fi list does, so the master switch is the first thing the eye lands on.
@@ -117,7 +117,7 @@ Panel {
 
   // ---- the bar face ---------------------------------------------------------------------------
   // Red means the tunnel is down while it is wanted, or its state cannot be read. Connected gets the accent
-  // (optional), everything else the plain foreground - dimmed while nothing is going on.
+  // (optional), everything else the plain foreground, dimmed while nothing is going on.
   readonly property string barGlyph: Model.glyphFor(vpn.vpnState)
   readonly property string barText: {
     var name = vpn.vpnState === "off" ? "" : (vpn.want || vpn.active)
@@ -255,7 +255,7 @@ Panel {
 
     // The bar label changes width with the state (bare shield -> "shield proton-ch..." -> "shield proton-ch"),
     // and KeyboardPanel centres the card on its anchor. In a right-aligned bar the button grows to the
-    // left, so the open panel slid sideways on every switch (freezing only the width made it worse - the
+    // left, so the open panel slid sideways on every switch (freezing only the width made it worse: the
     // anchor's x still moved). The panel anchors to this proxy instead: while
     // the panel is open it holds the screen position the button had at the moment of opening, whatever
     // the button does meanwhile. It re-centres on the next open.
@@ -383,7 +383,7 @@ Panel {
             }
           }
 
-          // Where the internet sees you - the only real proof the tunnel is doing anything.
+          // Where the internet sees you: the only real proof the tunnel is doing anything.
           Text {
             textFormat: Text.PlainText
             visible: text !== ""
