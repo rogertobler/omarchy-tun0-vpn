@@ -1,0 +1,78 @@
+#!/bin/bash
+# tun0 VPN: update the root side to a newer signed release.
+#
+#   sudo /usr/local/bin/vpn-update vX.Y.Z
+#
+# install.sh put this script here from a checked copy, so what runs is the code of the release installed now, not of
+# the one being fetched. It fetches the tag vX.Y.Z of this repository into /usr/local/lib/tun0-vpn, and before
+# anything from that release runs it checks that the tag is signed by the key pinned in /etc/vpn/release-signer at
+# the first installation (not by a key the new release names), that the tagged commit carries version X.Y.Z, and
+# that X.Y.Z is not older than the installed release. Only then does it check the tag out and hand over to its
+# install.sh, which checks the whole release again.
+set -Eeuo pipefail
+unset XDG_CONFIG_HOME SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy no_proxy NO_PROXY
+for v in $(compgen -v GIT_); do unset "$v"; done
+# Root's own environment for git: never the caller's HOME, git config, hooks, fsmonitor program, proxy or locale
+export PATH=/usr/bin HOME=/root GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 LC_ALL=C
+umask 022
+trap 'echo "vpn-update: failed at line $LINENO (see the message above, if any)" >&2' ERR
+
+TREE=/usr/local/lib/tun0-vpn
+ETC=/etc/vpn; PINNED=$ETC/release-signer; RECORD=$ETC/installed-release
+die() { echo "vpn-update: $*" >&2; exit 1; }
+root_only() {   # PATH: a directory or file (not a link) owned by root that neither its group nor others can write to
+  local st
+  [[ ! -L "$1" && -e "$1" ]] || return 1
+  st=$(stat -c '%u %a' -- "$1") || return 1
+  [[ "${st%% *}" == 0 ]] && (( (8#${st#* } & 8#022) == 0 ))
+}
+chain_root_only() {   # PATH: it and every directory above it are root_only
+  local d=$1
+  while :; do root_only "$d" || return 1; [[ "$d" == / ]] && return 0; d=$(dirname "$d"); done
+}
+tgit() { git -C "$TREE" -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
+manifest_version() { sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; }
+
+[[ $EUID -eq 0 ]] || die "run it with sudo"
+[[ $# -eq 1 && "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "usage: sudo /usr/local/bin/vpn-update vX.Y.Z (the release to update to, named in the README)"
+tag=$1; want=${tag#v}
+self=$(readlink -f -- "$0")
+[[ "$self" == /usr/local/bin/vpn-update ]] && chain_root_only "$self" || die "this runs only as /usr/local/bin/vpn-update, owned by root and writable by root only"
+[[ -f "$PINNED" ]] && root_only "$PINNED" || die "no release key is pinned in $PINNED: this machine was never installed with a checked release, follow Install in the README"
+chain_root_only "$TREE" && [[ -d "$TREE/.git" ]] || die "$TREE is missing, or not owned by root and writable by root only: follow Install in the README"
+bad=$(find "$TREE" \( -type l -o ! -user 0 -o -perm /022 \) -print -quit)
+[[ -z "$bad" ]] || die "$bad: everything in $TREE must belong to root, be writable by root only, and no link"
+[[ -z "$(tgit status --porcelain --untracked-files=all --ignored)" ]] || die "$TREE has changes of its own (git -C $TREE status --ignored): remove it and follow Install in the README"
+
+installed=""
+if [[ -f "$RECORD" ]] && root_only "$RECORD"; then installed=$(cut -d' ' -f1 "$RECORD"); fi
+[[ -n "$installed" ]] || installed=$(tgit show HEAD:manifest.json | manifest_version)
+[[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot tell which release is installed"
+[[ "$(printf '%s\n%s\n' "$installed" "$want" | sort -V | head -1)" == "$installed" ]] \
+  || die "$tag is older than the installed release $installed. Nothing was changed."
+
+# Always fetched again, forced, into a ref of its own and without following other tags: a tag once fetched from a
+# server that served the wrong one would otherwise stay and block every later update of that name (review 16.09.2026).
+# Whatever stops it from here on, the candidate does not stay behind.
+cand=refs/vpn-update/candidate
+trap 'tgit update-ref -d "$cand" >/dev/null 2>&1 || true' EXIT
+# A server that stalls or trickles does not hold root forever: at most five minutes, and under 1 kB/s for 30 s ends it
+timeout -k 5 300 git -C "$TREE" -c core.fsmonitor=false -c core.hooksPath=/dev/null -c fetch.fsckObjects=true \
+  -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+  fetch -q --no-tags --depth 1 https://github.com/rogertobler/omarchy-tun0-vpn "+refs/tags/$tag:$cand" \
+  || die "could not fetch $tag. Nothing was changed."
+[[ "$(tgit cat-file -t "$cand")" == tag ]] || die "$tag is not a signed tag. Nothing was changed."
+# The key pinned on this machine decides, not the key written into the release being fetched
+tgit -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$PINNED" verify-tag "$cand" >/dev/null 2>&1 \
+  || die "$tag is not signed by the release key pinned in $PINNED. Nothing was changed."
+# A signature covers the name inside the tag object, not the name it was served under
+[[ "$(tgit cat-file tag "$cand" | sed -n 's/^tag //p' | head -1)" == "$tag" ]] || die "the tag served as $tag names itself differently. Nothing was changed."
+commit=$(tgit rev-parse --verify "$cand^{commit}")
+tagged=$(tgit show "$commit:manifest.json" | manifest_version)
+[[ "$tagged" == "$want" ]] || die "$tag carries version ${tagged:-none} in manifest.json, not $want. Nothing was changed."
+echo "vpn-update: $tag is signed by the pinned release key; handing over to its install.sh"
+tgit update-ref "refs/tags/$tag" "$cand"; tgit update-ref -d "$cand"
+# The clone now follows this tag, as a clone made with --branch $tag would: install.sh checks exactly that
+tgit config --replace-all remote.origin.fetch "+refs/tags/$tag:refs/tags/$tag"
+tgit -c advice.detachedHead=false checkout -q --detach "$commit"
+exec "$TREE/install.sh"

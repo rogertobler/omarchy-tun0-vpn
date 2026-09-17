@@ -1,2 +1,13 @@
-# tun0 VPN (kill switch, watchdog, profiles): @USER@ may run exactly this one script as root without a password.
-@USER@ ALL=(root) NOPASSWD: /usr/local/bin/vpn-root
+# tun0 VPN: the user with id @UID@ may run the root helper without a password, and only in the forms the user side
+# needs. Each argument list must match one pattern whole (sudo 1.9.10 or later reads ^...$ as a regular expression).
+# The verbs the dispatcher and the systemd units call as root (boot, unload, netevent, sync, reconnect, rebuild) are
+# not here. install.sh writes this rule last and removes it first.
+# Every form carries the SHA-256 of the vpn-root this release installed. sudo checks it on each call, right before it
+# runs the helper, and runs the bytes it checked (by file descriptor); a vpn-root with other bytes is refused.
+Cmnd_Alias TUN0_VPN = sha256:@VPN_ROOT_SHA256@ /usr/local/bin/vpn-root ^(off|status|watch|unwatch|trust set)$, \
+                      sha256:@VPN_ROOT_SHA256@ /usr/local/bin/vpn-root ^(on|arm|add|remove) [a-z0-9]+-[a-z0-9]+$, \
+                      sha256:@VPN_ROOT_SHA256@ /usr/local/bin/vpn-root ^(auth|has-auth) [a-z0-9]+$, \
+                      sha256:@VPN_ROOT_SHA256@ /usr/local/bin/vpn-root ^set (killswitch|autoconnect|autodisconnect) (on|off)$, \
+                      sha256:@VPN_ROOT_SHA256@ /usr/local/bin/vpn-root ^set default [a-z0-9]+-[a-z0-9]+$, \
+                      sha256:@VPN_ROOT_SHA256@ /usr/local/bin/vpn-root ^trust (add|remove) .+$
+#@UID@ ALL=(root) NOPASSWD: TUN0_VPN

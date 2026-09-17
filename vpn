@@ -14,11 +14,14 @@
 #   vpn trust [add|remove|edit] [SSID]   trusted Wi-Fi networks (default: the one you are on; edit = TUI); vpn autoconnect|autodisconnect [on|off|toggle]
 #                          the list and both switches live in /etc/vpn: the dispatcher applies them as root, at pre-up, before login
 #   vpn menu               open the Omarchy menu (predecessor of the panel); vpn recent = last used profiles
+#   vpn lookup [on|off]    ask ipinfo.io where the traffic comes out (status, panel); on unless turned off
 #   vpn version            the version of the installed plugin, read from its manifest.json
 #   vpn menu-write | indicator | auto   internal: menu block, bar JSON (polled every 5 s); auto turns the dispatcher's last decision into a toast
 #   vpn is-on | is-wanted | is-active NAME | is-default NAME     conditions for the menu (exit code)
 # Full documentation: README.md in this repository.
 set -uo pipefail
+# Every tool by a fixed path, whatever PATH the caller or the shell hands over; on Arch all of them live in /usr/bin.
+export PATH=/usr/bin
 KS=/usr/local/bin/vpn-root
 MARK=/run/vpn-killswitch.active
 CFG_DIR=$HOME/.config/vpn              # only `recent` lives here; the policy state is root's (below)
@@ -32,12 +35,16 @@ TRUSTED_FILE=/etc/vpn/trusted          # trusted Wi-Fi networks, one SSID per li
 OPEN_FILE=/run/vpn-killswitch.open     # exists = the kill switch table is loaded; contents = the interfaces allowed past it
 EVENT_FILE=/run/vpn-killswitch.event   # the dispatcher's last automatic decision: epoch, kind, SSID, profile
 RECENT_FILE=$CFG_DIR/recent            # most recently used profiles, newest first, at most 5
-AUTO_STATE=${XDG_RUNTIME_DIR:-/tmp}/vpn-auto   # the event that was already turned into a toast
+LOOKUP_FILE=$CFG_DIR/ip-lookup         # "off": never ask ipinfo.io where the traffic comes out (`vpn lookup off`)
+# The event that was already turned into a toast. Only in the user's own runtime directory: without one there are no
+# toasts, rather than a predictable file in a directory everyone can write to.
+AUTO_STATE=""
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" ]]; then AUTO_STATE=$XDG_RUNTIME_DIR/vpn-auto; fi
 SELF=$(readlink -f "$0")
 
 CONF_DIR=/etc/vpn/configs
 
-ks()       { sudo -n "$KS" "$@"; }
+ks()       { /usr/bin/sudo -n "$KS" "$@"; }   # both by absolute path: the crossing into root never goes through PATH
 ks_setting() { user_setting killswitch; }   # empty = on
 uplink() { nmcli -t -f TYPE,DEVICE con show --active 2>/dev/null | awk -F: '$1!="vpn" && $1!="loopback" && $1!="tun" && $2!="" {print $2; exit}'; }
 # on = the uplink is shut and only the tunnel may carry traffic (a VPN is wanted, or untrusted Wi-Fi with auto-connect on);
@@ -119,7 +126,18 @@ stalled() {
     END { exit !s }'
 }
 live()        { nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="vpn"{print $1}' | grep -xF -f <(connections) 2>/dev/null || true; }   # ours, activated or activating
-default_con() {   # the file, else the first managed profile (install.sh and add write the file when it is missing)
+# Connections are brought up and down by UUID, never by name: another connection (a Wi-Fi called proton-ch) may carry
+# the same name (review of the marketplace, #4243).
+vpn_uuid()    { nmcli -t -f NAME,UUID,TYPE con show 2>/dev/null | awk -F: -v n="$1" '$1 == n && $3 == "vpn" {print $2; exit}'; }
+down_live() {   # [KEEP]: bring our active tunnels down by UUID, except the one named KEEP
+  local n u t mine
+  mine=$(connections)
+  while IFS=: read -r n u t; do
+    [[ "$t" == vpn && -n "$u" && "$n" != "${1:-}" ]] && grep -qxF -- "$n" <<<"$mine" && { nmcli con down uuid "$u" >/dev/null 2>&1 || true; }
+  done <<<"$(nmcli -t -f NAME,UUID,TYPE con show --active 2>/dev/null)"
+  return 0
+}
+default_con() {   # the setting, else the first managed profile (vpn-root add writes it when it is missing)
   local d; d=$(user_setting default)
   if [[ -n "$d" ]] && connections | grep -qx "$d"; then echo "$d"; else connections | head -1; fi
 }
@@ -183,7 +201,9 @@ auto() {
   [[ -r "$EVENT_FILE" ]] || return 0
   IFS=$'\t' read -r ts kind ssid name < "$EVENT_FILE" || true
   [[ -n "$ts" ]] || return 0
+  ssid=$(clean "$ssid" 64)
   if [[ "${1:-}" == "--dry-run" ]]; then echo "last decision: $kind on \"$ssid\"${name:+ ($name)}"; return 0; fi
+  [[ -n "$AUTO_STATE" ]] || return 0
   [[ "$ts" != "$(cat "$AUTO_STATE" 2>/dev/null)" ]] || return 0
   echo "$ts" > "$AUTO_STATE" 2>/dev/null || true
   case "$kind" in
@@ -192,17 +212,30 @@ auto() {
     noprofile)  notify -u critical "VPN: auto-connect has nothing to connect" "Untrusted Wi-Fi \"$ssid\", but no profile is set up - the network is left OPEN. Add a profile, or turn auto-connect off." ;;
   esac
 }
+# The widget and the toasts show SSIDs cleaned of control and direction characters and cut to 64 bytes, and hand back
+# what they show. Act on the network that text stands for: a known name equal to it, else the one known name that
+# cleans to exactly it (before, a cleaned name matched nothing, and the panel reported success).
+resolve_ssid() {
+  local want=$1 n hit="" count=0 names
+  names=$(known_wifi)
+  while IFS= read -r n; do [[ "$n" == "$want" ]] && { printf '%s' "$n"; return 0; }; done <<<"$names"
+  while IFS= read -r n; do
+    [[ -n "$n" && "$(clean "$n" 64)" == "$want" ]] && { hit=$n; count=$(( count + 1 )); }
+  done <<<"$names"
+  if (( count == 1 )); then printf '%s' "$hit"; else printf '%s' "$want"; fi
+}
 trust() {
   # vpn trust                     current network, the trusted list, the two auto settings
   # vpn trust add|remove [SSID]   default: the network we are on
   # vpn trust toggle [SSID]       the menu row
   local op=${1:-} ssid=${2:-}
+  if [[ -n "$ssid" && "$op" =~ ^(add|remove|toggle)$ ]]; then ssid=$(resolve_ssid "$ssid"); fi
   [[ -n "$ssid" ]] || ssid=$(current_ssid)
   case "$op" in
     ""|list)
-      printf 'Wi-Fi:       %s\n' "${ssid:-(not on Wi-Fi)}"
+      printf 'Wi-Fi:       %s\n' "$( [[ -n "$ssid" ]] && clean "$ssid" 64 || echo '(not on Wi-Fi)')"
       [[ -n "$ssid" ]] && { is_trusted "$ssid" && echo "             trusted" || echo "             untrusted"; }
-      echo "Trusted:     $( [[ -s "$TRUSTED_FILE" ]] && paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g' || echo '(none)')"
+      echo "Trusted:     $( [[ -s "$TRUSTED_FILE" ]] && clean "$(paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g')" 2048 || echo '(none)')"
       echo "Auto-connect on untrusted Wi-Fi:  $(v=$(user_setting autoconnect); echo "${v:-off}")"
       echo "Auto-disconnect on trusted Wi-Fi: $(v=$(user_setting autodisconnect); echo "${v:-off}")" ;;
     add)
@@ -234,7 +267,7 @@ trust() {
       printf '%s\n' "$sel" | ks trust set || { echo "Could not write the trusted list (sudo -n $KS trust set - sudoers?)" >&2; exit 1; }
       count=$(grep -c . "$TRUSTED_FILE" || true)
       menu_write >/dev/null; notify "VPN" "$count trusted network$( [[ $count == 1 ]] || echo s)"
-      echo "Trusted now: $(paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g')" ;;
+      echo "Trusted now: $(clean "$(paste -sd, "$TRUSTED_FILE" | sed 's/,/, /g')" 2048)" ;;
     *) echo "vpn trust [add|remove|toggle|edit] [SSID]" >&2; exit 2 ;;
   esac
 }
@@ -249,7 +282,11 @@ recent() {   # only names that still exist
   while read -r n; do [[ -n "$n" ]] && connections | grep -qx "$n" && echo "$n"; done < "$RECENT_FILE"
   return 0
 }
-jesc() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '%s' "$s"; }   # JSON string escaping for the menu block
+# Text from the network (SSIDs, the ipinfo answer, the clipboard) reaches terminals, toasts and the panel only
+# without control characters: C0, DEL, C1 and the bidirectional controls that reorder what is shown. And capped.
+CLEAN_CLASS='[\\x{00}-\\x{1f}\\x{7f}-\\x{9f}\\x{61c}\\x{200e}\\x{200f}\\x{202a}-\\x{202e}\\x{2066}-\\x{2069}]'
+clean() { printf '%s' "${1:-}" | jq -Rrjs --argjson n "${2:-128}" "gsub(\"$CLEAN_CLASS\"; \"\") | .[0:\$n]"; }
+jesc() { clean "$1" 256 | jq -Rrjs 'tojson | .[1:-1]'; }   # JSON string escaping for the menu block, by a real encoder
 
 # ---- one JSON blob for the bar widget ------------------------------------------------------------
 json_state() {
@@ -274,33 +311,61 @@ json_state() {
     [[ -n "$iface" && -r /sys/class/net/$iface/statistics/rx_bytes ]] && { rx=$(<"/sys/class/net/$iface/statistics/rx_bytes"); tx=$(<"/sys/class/net/$iface/statistics/tx_bytes"); }
   fi
   rec=$(recent)
-  printf '{"state":"%s","active":"%s","want":"%s","label":"%s","killswitch":"%s","watchdog":%s,"default":"%s",' \
-    "$state" "$cur" "$want" "$(jesc "$(label "${want:-$def}")")" "$kss" "$wd" "$def"
-  printf '"ssid":"%s","manual":%s,"trusted":%s,"autoconnect":%s,"autodisconnect":%s,' \
-    "$(jesc "$ssid")" "$( [[ -n "$ssid" && "$(cat /run/vpn-killswitch.manual 2>/dev/null)" == "$ssid" ]] && echo true || echo false)" "$( [[ -n "$ssid" ]] && is_trusted "$ssid" && echo true || echo false)" \
-    "$( [[ "$(user_setting autoconnect)" == on ]] && echo true || echo false)" "$( [[ "$(user_setting autodisconnect)" == on ]] && echo true || echo false)"
-  printf '"iface":"%s","rx":%s,"tx":%s,"now":%s,' "$iface" "$rx" "$tx" "$(date +%s)"
-  printf '"trustedList":['; first=1
-  while read -r n; do [[ -n "$n" ]] || continue; (( first )) || printf ','; first=0; printf '"%s"' "$(jesc "$n")"; done < <(cat "$TRUSTED_FILE" 2>/dev/null || true)
-  # every Wi-Fi NetworkManager knows (saved profiles), so the panel can trust one you are not on right now
-  printf '],"knownWifi":['; first=1
-  while read -r n; do [[ -n "$n" ]] || continue; (( first )) || printf ','; first=0; printf '"%s"' "$(jesc "$n")"; done < <(known_wifi)
-  printf '],"profiles":['; first=1
+  # Built by jq, not by printf: every string is encoded properly, network-derived ones are cleaned and capped, and
+  # the lists are bounded (review of the marketplace, 16.09.2026).
+  local profiles="" n
   while read -r n; do
-    [[ -n "$n" ]] || continue; (( first )) || printf ','; first=0
-    printf '{"name":"%s","label":"%s","provider":"%s","country":"%s","active":%s,"default":%s,"recent":%s}' \
-      "$n" "$(jesc "$(label "$n")")" "${n%%-*}" "${n##*-}" \
-      "$( [[ "$n" == "$cur" ]] && echo true || echo false)" "$( [[ "$n" == "$def" ]] && echo true || echo false)" \
-      "$( grep -qx -- "$n" <<<"$rec" && echo true || echo false)"
-  done < <({ echo "$def"; echo "$rec"; connections; } | awk 'NF && !seen[$0]++')
-  printf ']}\n'
+    [[ -n "$n" ]] || continue
+    profiles+="$n"$'\t'"$(label "$n")"$'\t'"$( [[ "$n" == "$cur" ]] && echo 1 || echo 0)"$'\t'"$( [[ "$n" == "$def" ]] && echo 1 || echo 0)"$'\t'"$(grep -qx -- "$n" <<<"$rec" && echo 1 || echo 0)"$'\n'
+  done < <({ echo "$def"; echo "$rec"; connections; } | awk 'NF && !seen[$0]++' | head -n 64)
+  jq -cn \
+    --arg state "$state" --arg active "$cur" --arg want "$want" --arg label "$(label "${want:-$def}")" \
+    --arg killswitch "$kss" --argjson watchdog "$wd" --arg default "$def" --arg ssid "$ssid" \
+    --argjson manual "$( [[ -n "$ssid" && "$(cat /run/vpn-killswitch.manual 2>/dev/null)" == "$ssid" ]] && echo true || echo false)" \
+    --argjson trusted "$( [[ -n "$ssid" ]] && is_trusted "$ssid" && echo true || echo false)" \
+    --argjson autoconnect "$( [[ "$(user_setting autoconnect)" == on ]] && echo true || echo false)" \
+    --argjson autodisconnect "$( [[ "$(user_setting autodisconnect)" == on ]] && echo true || echo false)" \
+    --argjson lookup "$(lookup_on && echo true || echo false)" \
+    --arg iface "$iface" --argjson rx "${rx:-0}" --argjson tx "${tx:-0}" --argjson now "$(date +%s)" \
+    --arg trustedList "$(head -n 1024 "$TRUSTED_FILE" 2>/dev/null)" --arg knownWifi "$(known_wifi | head -n 256)" \
+    --arg profiles "$profiles" \
+    "def clean(\$n): gsub(\"$CLEAN_CLASS\"; \"\") | .[0:\$n];
+     def lines: split(\"\n\") | map(select(length > 0));
+     { state: \$state, active: \$active, want: \$want, label: (\$label | clean(96)), killswitch: \$killswitch,
+       watchdog: \$watchdog, default: \$default, ssid: (\$ssid | clean(64)), manual: \$manual, trusted: \$trusted,
+       autoconnect: \$autoconnect, autodisconnect: \$autodisconnect, lookup: \$lookup,
+       iface: (\$iface | clean(15)), rx: \$rx, tx: \$tx, now: \$now,
+       trustedList: (\$trustedList | lines | map(clean(64))),
+       knownWifi: (\$knownWifi | lines | map(clean(64))),
+       profiles: (\$profiles | lines | map(split(\"\t\") | { name: .[0], label: (.[1] | clean(96)),
+         provider: (.[0] | split(\"-\")[0]), country: (.[0] | split(\"-\")[1]),
+         active: (.[2] == \"1\"), default: (.[3] == \"1\"), recent: (.[4] == \"1\") })) }"
+}
+lookup_on() { [[ "$(cat "$LOOKUP_FILE" 2>/dev/null)" != off ]]; }
+# ipinfo: one bounded request to ipinfo.io. HTTPS only, no redirects, 3 s to connect, 5 s in all, at most 16 KiB
+# (read as 16 KiB + 1 and refused when longer, also when the server sends no or a false length). Prints
+# {ip,country,city,org} with every field checked (ip an IPv4 address, country two capitals, the rest cleaned and
+# capped), or nothing.
+ipinfo() {
+  local body
+  lookup_on || return 0
+  body=$(curl -q -4 -s --proto '=https' --proto-redir '=https' --max-redirs 0 --connect-timeout 3 --max-time 5 \
+           --max-filesize 16384 https://ipinfo.io/json 2>/dev/null | head -c 16385) || true
+  (( $(printf '%s' "$body" | wc -c) > 0 && $(printf '%s' "$body" | wc -c) <= 16384 )) || return 0
+  jq -c "def clean(\$n): (if type == \"string\" then . else \"\" end) | gsub(\"$CLEAN_CLASS\"; \"\") | .[0:\$n];
+    select(type == \"object\")
+    | { ip: (.ip | clean(15) | if test(\"^[0-9]{1,3}(\\\\.[0-9]{1,3}){3}\$\") then . else \"\" end),
+        country: (.country | clean(2) | if test(\"^[A-Z]{2}\$\") then . else \"\" end),
+        city: (.city | clean(64)), org: (.org | clean(96) | sub(\"^AS[0-9]+ \"; \"\")) }
+    | select(.ip != \"\")" <<<"$body" 2>/dev/null || true
 }
 public_ip() {
   # Where does the traffic really come out? Slow (a round trip to ipinfo.io), so the widget asks only when
-  # the panel opens or the state changes. Empty fields when offline or blocked - never an error.
+  # the panel opens or the state changes. Empty fields when offline, blocked or turned off - never an error.
   local info
-  info=$(curl -4 -s --max-time 5 https://ipinfo.io/json 2>/dev/null || true)
-  jq -c '{ip: (.ip // ""), country: (.country // ""), city: (.city // ""), org: ((.org // "") | sub("^AS[0-9]+ "; ""))}' <<<"$info" 2>/dev/null || echo '{"ip":"","country":"","city":"","org":""}'
+  if ! lookup_on; then echo '{"ip":"","country":"","city":"","org":"","lookup":false}'; return 0; fi
+  info=$(ipinfo)
+  if [[ -n "$info" ]]; then jq -c '. + {lookup: true}' <<<"$info"; else echo '{"ip":"","country":"","city":"","org":"","lookup":true}'; fi
 }
 
 status() {
@@ -319,7 +384,7 @@ status() {
   esac
   local ssid; ssid=$(current_ssid)
   if [[ -n "$ssid" ]]; then
-    printf 'Wi-Fi:       %s (%s)' "$ssid" "$(is_trusted "$ssid" && echo trusted || echo untrusted)"
+    printf 'Wi-Fi:       %s (%s)' "$(clean "$ssid" 64)" "$(is_trusted "$ssid" && echo trusted || echo untrusted)"
     [[ "$(user_setting autoconnect)" == "on" ]] && printf ' · auto-connect on'
     [[ "$(user_setting autodisconnect)" == "on" ]] && printf ' · auto-disconnect on'
     echo
@@ -329,15 +394,20 @@ status() {
   if [[ "${1:-}" == "--ip" ]]; then
     # Cross-check from outside: where does the traffic really exit? (ipinfo.io, ~1000 requests/day without a key)
     local info ip country city org
-    info=$(curl -4 -s --max-time 5 https://ipinfo.io/json 2>/dev/null || true)
-    IFS=$'\t' read -r ip country city org < <(jq -r '[.ip // "", .country // "", .city // "", .org // ""] | @tsv' <<<"$info" 2>/dev/null || true)
+    if ! lookup_on; then echo 'Public IP:   not looked up (turned off: vpn lookup on)'; ip=""
+    else
+      info=$(ipinfo)
+      # joined by the unit separator, not a tab: read merges consecutive tabs, so an empty city moved the provider into
+      # its place, and an empty country the city into the country (the fields are cleaned, none holds a control byte)
+      IFS=$'\x1f' read -r ip country city org < <(jq -r '[.ip, .country, .city, .org] | join([31] | implode)' <<<"$info" 2>/dev/null || true)
+    fi
     if [[ -n "${ip:-}" ]]; then
       printf 'Public IP:   %s\n' "$ip"
-      printf 'Seen as:     %s (%s)%s%s\n' "$(country_name "$country")" "$country" "${city:+, $city}" "${org:+ · ${org#AS[0-9]* }}"
+      printf 'Seen as:     %s (%s)%s%s\n' "$(country_name "$country")" "$country" "${city:+, $city}" "${org:+ · $org}"
       if [[ -n "$cur" && "${country,,}" != "${cur##*-}" ]]; then
         echo "!! Expected ${cur##*-}, seen ${country,,} - traffic is NOT going through the tunnel (or ipinfo maps the IP differently)"
       fi
-    else
+    elif lookup_on; then
       printf 'Public IP:   unreachable\n'
     fi
   fi
@@ -349,7 +419,7 @@ status() {
 }
 
 connect() {
-  local name cur n want
+  local name cur n want uuid
   if [[ -n "${1:-}" ]]; then
     name=$(resolve "$1") || die_unknown "$1"
   else
@@ -365,13 +435,14 @@ connect() {
   # anything, so switching away from a running tunnel stays leak-free. What must not happen is a second attempt
   # while the first is still negotiating (08.09. 14:26: two racing connects, 33 s dark) - see "Superseded" below.
   ks arm "$name" \
-    || { echo "Could not arm the kill switch (sudoers? /etc/vpn/killswitch.nft? -> sudo ./install.sh)" >&2; exit 1; }
+    || { echo "Could not arm the kill switch (sudoers? /etc/vpn/killswitch.nft? -> sudo /usr/local/lib/tun0-vpn/install.sh)" >&2; exit 1; }
   # Switching: bring the old profile(s) down first - activated or still activating; the kill switch stays up meanwhile.
   # Then stop the watchdog: the old profile's vpn-down starts one (marker present), and a watchdog racing our own
   # `nmcli con up` was the 08.09. blackout; stopping it before the down would only let vpn-down start a fresh one.
-  for n in $(live); do [[ "$n" == "$name" ]] || nmcli con down "$n" >/dev/null 2>&1 || true; done
+  down_live "$name"
   ks unwatch
-  if nmcli con up "$name"; then
+  uuid=$(vpn_uuid "$name")
+  if [[ -n "$uuid" ]] && nmcli con up uuid "$uuid"; then
     recent_add "$name" && menu_write >/dev/null   # recently used profiles move up in the menu
     if ks on "$name"; then   # belt and braces; normally already done by the dispatcher
       notify "VPN connected" "$(label "$name") ($name), kill switch $(ks_state)"
@@ -400,7 +471,7 @@ connect() {
 disconnect() {
   local n ok=1
   ks off || ok=0   # first: without the marker the dispatcher knows this disconnect is intended; also opens the uplink
-  for n in $(live); do nmcli con down "$n" >/dev/null 2>&1 || true; done   # activated AND activating ones
+  down_live   # activated AND activating ones
   if (( ok )); then
     notify "VPN disconnected" "Network released - open until you change network"
   else notify -u critical "VPN: could not remove the kill switch" "sudo -n $KS off failed - check /etc/sudoers.d/vpn"; fi
@@ -473,14 +544,15 @@ add() {
               | sort -rn | cut -f2- | awk '!seen[$0]++' | head -40 | gum choose --header "Pick the config" --height 15) || continue
           ;;
         "Paste"*)
-          tmp=$(mktemp --suffix=.ovpn)
-          wl-paste --type text/plain --no-newline > "$tmp" 2>"$tmp.err" || true   # wl-paste infers a MIME type from the .ovpn suffix otherwise
+          # A directory of our own (mode 700), so no other process can predict or swap the file; it may hold inline
+          # keys, so it is gone on every way out, "Cancelled." included.
+          tmpd=$(mktemp -d); trap 'rm -rf "$tmpd"' EXIT; tmp=$tmpd/clipboard.ovpn
+          wl-paste --type text/plain --no-newline 2>"$tmpd/err" | head -c 1048577 > "$tmp" || true   # wl-paste infers a MIME type from the .ovpn suffix otherwise
           if ! grep -q '^remote ' "$tmp"; then
             err "The clipboard does not hold an OpenVPN config (no 'remote' line)."
-            err "Got $(wc -c <"$tmp") bytes$( [[ -s "$tmp.err" ]] && echo ", wl-paste said: $(head -c 120 "$tmp.err")" ): $(head -c 80 "$tmp" | tr '\n' ' ')"
-            rm -f "$tmp" "$tmp.err"; tmp=""; continue
+            err "Got $(wc -c <"$tmp") bytes$( [[ -s "$tmpd/err" ]] && echo ", wl-paste said: $(clean "$(head -c 120 "$tmpd/err")" 120)" ): $(clean "$(head -c 80 "$tmp" | tr '\n' ' ')" 80)"
+            rm -f "$tmp"; tmp=""; continue
           fi
-          rm -f "$tmp.err"
           f=$tmp; echo "Config taken from the clipboard ($(grep -c '^remote ' "$f") remote lines)."
           ;;
         *)
@@ -505,7 +577,7 @@ add() {
   if ! ks has-auth "$prov"; then
     gum style --faint "No credentials for '$prov' yet. Proton: OpenVPN/IKEv2 username from account.protonvpn.com (not the account password). Mullvad: account number, password m."
     while :; do                                # credentials: an empty field is a slip, not a reason to start over
-      u=$(gum input --header "Username for $prov" --value "${u:-}") || { echo "Cancelled."; exit 1; }
+      u=$(gum input --header "Username for $prov") || { echo "Cancelled."; exit 1; }   # never pre-filled: an argument of gum is in the process list
       p=$(gum input --header "Password for $prov" --password) || { echo "Cancelled."; exit 1; }
       [[ -n "$u" && -n "$p" ]] && break
       err "Username and password are both required. Esc cancels the wizard."
@@ -514,7 +586,12 @@ add() {
     gum style --faint "Credentials for '$prov' are already stored."
   fi
   gum confirm "Add '$name' ($(label "$name")) from $(basename "$f")?" || { echo "Cancelled."; exit 1; }
-  if out=$(printf '%s\n%s\n' "${u:-}" "${p:-}" | ks add "$name" "$f" 2>&1); then
+  # The file is opened here, as you; root gets its bytes on stdin and never a path to open with its own rights.
+  if [[ -n "${u:-}" ]] && ! out=$(printf '%s\n%s\n' "$u" "$p" | ks auth "$prov" 2>&1); then
+    [[ -n "${tmp:-}" ]] && rm -f "$tmp"
+    notify -u critical "VPN: adding failed" "$out"; err "$out"; exit 1
+  fi
+  if out=$(ks add "$name" < "$f" 2>&1); then
     unset _cons
     # the first profile becomes the default - vpn-root add does that
     menu_write >/dev/null
@@ -615,6 +692,10 @@ version() {
     v=$(manifest_version "$m")
     [[ -n "$v" ]] || continue
     printf 'tun0 VPN %s\n' "$v"
+    # The root side is updated on its own (vpn-update), so the two can differ; say so rather than guess.
+    local rv; rv=$(cut -d' ' -f1 /etc/vpn/installed-release 2>/dev/null || true)
+    if [[ -z "$rv" ]]; then echo "note: no release of the root side is recorded (/etc/vpn/installed-release); see Install in the README" >&2
+    elif [[ "$rv" != "$v" ]]; then echo "note: the widget is $v, the root side is $rv" >&2; fi
     # Preparing a release is the one moment when a checkout carries a newer number than the installed plugin.
     # Reporting only the installed one would answer the wrong question exactly then.
     if [[ "$m" != "$sib" && -r "$sib" ]]; then
@@ -667,6 +748,13 @@ case "${1:-status}" in
   is-autodisconnect) [[ "$(user_setting autodisconnect)" == "on" ]] ;;
   is-trusted)   is_trusted "$(current_ssid)" ;;
   recent)       recent ;;
+  lookup)       case "${2:-}" in
+                  on)  mkdir -p "$CFG_DIR"; rm -f "$LOOKUP_FILE"; notify "VPN" "Public IP lookup on" ;;
+                  off) mkdir -p "$CFG_DIR"; echo off > "$LOOKUP_FILE"; notify "VPN" "Public IP lookup off" ;;
+                  "") ;;
+                  *) echo "vpn lookup [on|off]" >&2; exit 2 ;;
+                esac
+                lookup_on && echo "public IP lookup: on (ipinfo.io)" || echo "public IP lookup: off" ;;
   add)          add "${2:-}" ;;
   remove)       remove "${2:-}" ;;
   menu)         exec omarchy-menu summon vpn ;;

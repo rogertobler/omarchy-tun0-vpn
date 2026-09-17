@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rogertobler.tun0-vpn",
   "name": "tun0 VPN",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Roger Tobler",
   "license": "MIT",
   "description": "OpenVPN profiles from any provider with their own nftables kill switch, a reconnect watchdog, trusted Wi-Fi networks and a terminal-free import - one shield in the bar.",

@@ -12,9 +12,10 @@
 #   vpn-down             do NOT clean up - NetworkManager reports vpn-down for a drop as well as for an intended
 #                        disconnect. If the marker is there (= the user wanted a VPN), start the reconnect watchdog.
 #                        Only `vpn off` lifts it.
+export PATH=/usr/bin   # runs as root: its tools by a fixed path only, whatever the environment it was started with
 ROOT=/usr/local/bin/vpn-root
 [[ -x "$ROOT" ]] || exit 0
-managed() { [[ -f "/etc/vpn/configs/${CONNECTION_ID:-}.ovpn" ]]; }   # only profiles managed by vpn; foreign VPNs untouched
+managed() { [[ "${CONNECTION_ID:-}" =~ ^[a-z0-9]+-[a-z0-9]+$ && -f "/etc/vpn/configs/$CONNECTION_ID.ovpn" ]]; }   # only profiles managed by vpn; foreign VPNs untouched
 
 case "$2" in
   pre-up|up|pre-down|down)

@@ -7,6 +7,125 @@ The version in `manifest.json` is the single source of truth. Every release is o
 `vX.Y.Z`, with a GitHub release carrying the section below. Between releases `main` stands still, because the
 Omarchy marketplace pins a listing to an exact commit.
 
+## [1.1.0] 2026-09-17
+
+The root side no longer trusts anything from a folder you can write to. The installation and update commands
+change; see Install and Update in the README.
+
+### Security
+
+* `install.sh` runs only from a release that root clones into `/usr/local/lib/tun0-vpn`, never from the plugin
+  folder, which belongs to the user and to every program the user runs. Before it changes anything it checks that
+  every directory from `/` down to that tree and everything in it belongs to root and is writable by root only,
+  that the checkout is the unmodified commit of the release tag, and that the tag is signed by the release key.
+  The key is pinned in `/etc/vpn/release-signer` at the first installation (marketplace security review).
+* Updates go through `/usr/local/bin/vpn-update vX.Y.Z`, the updater of the release installed now: it checks the
+  new tag against the pinned key, the version in the tagged commit, and that the release is not older than the
+  installed one, before anything of the new release runs. It fetches the tag afresh into a ref of its own every
+  time and checks that the signed tag names itself as the release asked for. `install.sh` refuses an older release,
+  and a clone holding a tag under another name than its own. At the first installation it prints the fingerprint it
+  pins.
+* Each file `install.sh` installs, the widget files included, is checked in the tree for its canonical path, owner and
+  mode, copied into a staging directory only root can read, and the SHA-256 of that copy is checked against
+  `SHA256SUMS` in the signed commit. That copy is what is installed; a file changed in the tree after the check does
+  not reach the system.
+* `install.sh` checks what would otherwise fail after the sudoers rule is gone (the user's folders, the configs on
+  its command line, their credentials) before it removes the rule, and says so if it stops half way. Git runs with
+  root's own home and no global configuration.
+* The sudoers rule admits `vpn-root` only in the argument forms the user side sends, names the user by id, and
+  leaves out the verbs only the dispatcher and the units call as root. Every form carries the SHA-256 of the installed
+  `vpn-root`, which sudo checks on each call right before it runs the helper, so a helper changed after the
+  installation is refused. `install.sh` removes the rule first and writes it last.
+* `install.sh` refuses a clone not made with `--branch v<version>`: a branch or an unsigned tag named like a newer
+  release on the commit of an older one would have installed that older release. `vpn-update` records the tag it
+  installs the same way, and removes the fetched candidate again whatever stops it; its fetch is bounded in time.
+* `install.sh` and `vpn-uninstall` touch only what is tun0 VPN's: a file under one of its names that another package
+  or the admin put there (`/etc/sudoers.d/vpn`, `~/.local/bin/vpn`, a dispatcher link, an entry in `/etc/vpn`) stops
+  the installation and is left by the removal. A NetworkManager connection is brought up, taken down and deleted only
+  by UUID and only if it is a VPN (`vpn on`, `vpn off`, the watchdog, removal), so a Wi-Fi named like a profile is never
+  touched.
+* Credentials reach NetworkManager through libnm instead of an `nmcli` argument, so the password no longer shows in
+  the process list during an import.
+* OpenVPN script and plugin hooks (`up`, `down`, `plugin`, `script-security` and the like) are removed from the copy of
+  a config that is imported. NetworkManager's importer already ignored them; root no longer relies on that. The
+  helper starts as `bash -p`.
+* The kill switch lets each VPN server through only on the port and protocol its config names (address and port
+  pairs per protocol); before, every listed server was reachable on every listed port.
+* Inputs of the root helper have limits and are refused above them: credentials 4 KiB, a trusted name 128 bytes,
+  1024 trusted names, 64 profiles, 4096 server endpoints.
+* The widget runs `vpn` by absolute path under a timeout, with a cleared environment, keeps at most 256 KiB of its
+  output, and shows everything as plain text. `vpn json` and `vpn public` build their JSON with `jq` and clean every
+  string from the network or a config of control and direction characters.
+* `vpn-root` checks every argument against a fixed form before using it. An interface name with a quote in it could
+  have added commands of its own to the nft batch that fills the open set; a profile name with a path in it could
+  have armed a config outside `/etc/vpn/configs`.
+* `vpn-root add` takes the config on stdin and `vpn-root auth` the credentials, so root never opens a path its
+  caller names. The installer opens the configs named on its command line with the user's rights.
+* A config that names a file for a certificate, a key or proxy credentials is refused. NetworkManager's importer runs
+  as root in `vpn-root add`; it read an `http-proxy` or `socks-proxy` credentials file right away and stored its first
+  line where the user can read it, so the first line of any file root can read was one `vpn add` away. Since 1.0.0.
+  A control character inside a line is refused as well (the importer splits a line there), `[inline]` is no
+  exception, and the check runs again before every import, for configs stored by 1.0.0.
+* A remote host token that starts with a dash is refused; `trust set` refuses a list over 64 KiB instead of cutting
+  it, where a cut line would have become a trusted network.
+* The helper, the installer, the updater and the uninstaller find their tools through `PATH=/usr/bin` only, never
+  through the caller's `PATH`, and run with `LC_ALL=C`; `vpn` calls `/usr/bin/sudo` by its full path.
+* Root no longer writes into the home directory: the `vpn` command, the widget files and their removal go through
+  `sudo -u` with the user's rights, so a link placed there leads nowhere the user could not go.
+* The migration of settings from versions before 1.0.0, which read files in the home directory as root, is gone.
+* `uninstall.sh` runs only as `/usr/local/bin/vpn-uninstall` or from the release, and removes the release and
+  `vpn-update` too. A step in the home directory that fails no longer stops the removal of the root parts, and it
+  takes down only this plugin's tunnels, no longer every VPN. `--keep-profiles` keeps the pinned key and drops the
+  record of the installed release.
+
+### Changed
+
+* `install.sh` no longer installs `networkmanager-openvpn` with pacman. It checks for it and for the other
+  requirements before it changes anything and names what is missing; install it first
+  (`sudo pacman -S --needed networkmanager-openvpn`).
+* The public IP lookup (ipinfo.io) is one bounded HTTPS request without redirects, keeps only four checked fields,
+  and can be turned off with `vpn lookup off`; the panel then says so.
+* The panel says the state is unknown when `vpn json` fails, instead of showing the last good state, and acts on
+  nothing until it can read the state again (right-click then refreshes).
+* The fingerprint `install.sh` prints for the key it pins is the real one (it printed "fingerprint unknown").
+
+* `install.sh` no longer removes the bar module and menu block that versions before 1.0.0 wrote into `shell.json`
+  and `omarchy-menu.jsonc`, and no longer sets a default profile; `vpn-root add` does that for the first profile.
+* A widget folder without git (the copy of an earlier installer) gets the widget files of the release; a folder
+  `omarchy plugin add` cloned is left to `omarchy plugin update`, and `install.sh` says when it is older.
+* `vpn version` also says when the root side is a different release than the widget.
+* Certificates and keys in a config have to be inline (`<ca>...</ca>`); Windows line ends are converted.
+* A `remote` line without a port is accepted and gets the config's `port` or `rport`, else OpenVPN's 1194, in the kill
+  switch.
+* User names with capitals or dots are accepted by the installer and the uninstaller.
+
+### Fixed
+
+* The installer never enabled the plugin, and the uninstaller never disabled it, rescanned the plugins or refreshed
+  the menu. They call `omarchy`, `omarchy-shell` and `omarchy-menu` through `sudo -u`, which starts from an empty
+  environment, and all three refuse to run without `OMARCHY_PATH`; `omarchy-shell -q` then ends with success and does
+  nothing. Both now pass `OMARCHY_PATH=/usr/share/omarchy`. The installer enables the widget without a placement: a
+  new one goes to the right of the bar, one you have placed stays where it is.
+* The uninstaller removed the widget and rescanned the plugins without checking the screen lock, which crashes the
+  shell under a lock, and the installer rescanned and enabled after its second check without asking again. Both check
+  first now; a lock that comes while the uninstaller runs leaves the widget in place and names the commands for after.
+* `trust add` kept to the limit of 1024 trusted names that `trust set` enforces; one add too many made `vpn trust edit`
+  fail. A refused profile at the limit of 64 forgets the credentials of a new provider, like any other failed add.
+* Trusting or forgetting a network from the panel or a toast acts on the network itself when its name holds control or
+  direction characters, which the panel shows cleaned.
+* `vpn status --ip` no longer shifts the fields when the city or the country is empty.
+* Temporary files the helper leaves after an interrupted write no longer count as foreign for `install.sh`, and
+  `vpn-uninstall` removes them; what it leaves in `/etc/vpn` or `~/.config/vpn` it names.
+
+* A failed NetworkManager import during `vpn add` reported success and left the config behind; it now fails and
+  rolls the config back.
+* A failed `vpn add` left the credentials of a new provider stored with no profile, so the wizard never asked for
+  them again; they are forgotten now when no profile of that provider is left.
+* A connection UUID in the older 40-hex form NetworkManager still accepts is no longer treated as invalid.
+* `install.sh` no longer hangs when `sudo -u` cannot run anything, and a hang-up of the terminal after the sudoers rule
+  was removed is reported like any other stop.
+* The clipboard copy of a config in the `vpn add` wizard is removed on every way out, "Cancelled." included.
+
 ## [1.0.0] 2026-09-09
 
 First public release. Built and used daily on Omarchy 4.0.2 since 8 September 2026.
@@ -54,4 +173,5 @@ First public release. Built and used daily on Omarchy 4.0.2 since 8 September 20
 * The installer refuses to run while the screen is locked, because writing into the live plugin folder makes the
   shell hot reload and Omarchy 4.0.2 crashes when that happens under an active lock.
 
+[1.1.0]: https://github.com/rogertobler/omarchy-tun0-vpn/releases/tag/v1.1.0
 [1.0.0]: https://github.com/rogertobler/omarchy-tun0-vpn/releases/tag/v1.0.0

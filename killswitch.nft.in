@@ -7,16 +7,21 @@
 # The NetworkManager dispatcher decides at pre-up, before the interface is usable, so an untrusted network
 # never sees a first packet - not even before anyone is logged in. If the tunnel goes away the table stays
 # up and the interface stays out of the set -> no network, until `vpn off` or the watchdog brings it back.
-# Template: `vpn-root rebuild` replaces @ENDPOINTS@/@PORTS@ with the remote lines of EVERY .ovpn in
-# /etc/vpn/configs/ (host names are resolved at that point); @OPEN_ELEMENTS@ is filled at load time.
+# Template: `vpn-root rebuild` fills the two endpoint sets with the server address and port pairs of the remote lines
+# of EVERY .ovpn in /etc/vpn/configs/ (host names are resolved at that point); the open set is filled at load time.
 
 table inet vpn_ks
 delete table inet vpn_ks
 
 table inet vpn_ks {
-	set endpoints {
-		type ipv4_addr
-		elements = { @ENDPOINTS@ }
+	# The VPN servers, as address and port pairs: a server is reachable on the ports its config names, not on any.
+	set endpoints_udp {
+		type ipv4_addr . inet_service
+		@UDP_ELEMENTS@
+	}
+	set endpoints_tcp {
+		type ipv4_addr . inet_service
+		@TCP_ELEMENTS@
 	}
 
 	# Interfaces that may carry traffic outside the tunnel. Empty at boot: nothing is open until the
@@ -33,11 +38,13 @@ table inet vpn_ks {
 		oifname "tun*" accept
 		oifname @open accept
 
-		# OpenVPN handshake to the VPN servers (ports taken from the .ovpn; UDP and TCP, depending on proto)
-		ip daddr @endpoints udp dport { @PORTS@ } accept
-		ip daddr @endpoints tcp dport { @PORTS@ } accept
+		# OpenVPN handshake to the VPN servers, exactly the address, port and protocol pairs of the configs
+		ip daddr . udp dport @endpoints_udp accept
+		ip daddr . tcp dport @endpoints_tcp accept
 
-		# DHCP, so Wi-Fi can keep and renew its address
+		# DHCP, so Wi-Fi can keep and renew its address. Not bound to a server: the address to renew with is not known
+		# before the lease, and the broadcast has none. Only root can send from port 68 (below 1024), and what goes
+		# out is a DHCP request of the machine itself.
 		udp sport 68 udp dport 67 accept
 
 		# IPv6 housekeeping only: neighbour discovery, router advertisements, MLD, DHCPv6. Not the whole link-local

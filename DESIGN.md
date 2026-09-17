@@ -133,6 +133,86 @@ too, otherwise auto-disconnect on a trusted network would tear it down at once.
   shut throughout.
 - The sudoers rule means any process running as you can open the kill switch. It protects you from the network,
   not from software you run.
+- The first installation trusts the release that root clones from GitHub, and the key named in it. From then on
+  that key is pinned, and `vpn-update` checks every later release against it before anything of that release runs;
+  a change of key is refused until you remove `/etc/vpn/release-signer` by hand. Running the `install.sh` of a
+  release by hand, past `vpn-update`, trusts that release as the first installation does.
+- The public IP lookup sends one request to ipinfo.io whenever the state changes to connected or off; ipinfo.io learns
+  that this address uses the plugin at those moments. `vpn lookup off` turns it off.
+
+## The boundary between you and root
+
+A plugin folder belongs to you, and so does every program you run. Whatever root reads from there, it reads in a
+state some program running as you may have set a moment earlier: a script replaced between typing `sudo` and its
+start, a file swapped between the check and the copy, a link where a file was. So root reads nothing from there.
+
+- **Where the root side comes from.** Root clones the release itself, into `/usr/local/lib/tun0-vpn`, and
+  `install.sh` runs only from exactly there. The clone must follow exactly the tag `v<version>` (`remote.origin.fetch`
+  as `git clone --branch` writes it): a branch, or an unsigned tag, named like a newer release but sitting on the
+  commit of an older one would otherwise install that older release under the name asked for. `vpn-update` sets the
+  same after it fetched a release. Before it changes anything it checks that every directory from `/` down
+  to that tree and everything in it belongs to root and is writable by root only, that the checkout is the
+  unmodified commit of the release tag, and that the tag is signed by the release key. The key is written into
+  `install.sh`, listed as a signing key of the GitHub account, and pinned in `/etc/vpn/release-signer` at the first
+  installation.
+- **Updates.** A check inside the new release protects nothing, because a changed release would simply leave it
+  out. So the check runs in the release installed now: `install.sh` puts `vpn-update` into `/usr/local/bin`, and
+  `vpn-update` fetches the new tag, checks its signature against the pinned key, checks that the tagged commit
+  carries the version asked for and that it is not older than the installed release (recorded in
+  `/etc/vpn/installed-release`), and only then checks it out and hands over to its `install.sh`. The tag is fetched
+  afresh every time into a ref of its own, without following other tags, and its name inside the signed object must
+  be the name asked for: a signature covers what the tag says it is, not the name a server serves it under.
+- **What is installed.** Each file, the widget files included, is checked in the tree for its canonical path, owner
+  and mode, then copied into a staging directory only root can read, and the SHA-256 of that copy is checked against
+  `SHA256SUMS` in the signed commit. The copy is what is installed; the tree is not read again, so a file changed
+  after the check does not reach the system.
+- **Nothing of anyone else's.** Every file `install.sh` writes names itself as `tun0 VPN` in its first lines (the
+  two scripts of 1.0.0 that did not are recognised by their own first comment), the dispatcher links point at its
+  script, and `/etc/vpn` holds only the entries the helper writes. A file under one of these names that is not tun0
+  VPN's stops the installation before anything changes, and `vpn-uninstall` removes by the same rule: an admin's own
+  `/etc/sudoers.d/vpn` or a `~/.local/bin/vpn` of another tool stays where it is. No package is installed either:
+  `install.sh` checks for `networkmanager-openvpn`, `python-gobject`, `nftables`, `jq`, `curl` and sudo 1.9.10, and
+  names what is missing.
+- **Nothing half way.** What would otherwise fail after the sudoers rule is gone is checked first: that you can
+  write where the `vpn` command and the widget go, that the configs named on the command line are readable, and
+  the credentials they need are asked for. If it stops anyway, it says that the rule stays removed until it runs
+  through. Git runs with root's own home and no global configuration, so no fsmonitor program or signing program of
+  yours runs as root.
+- **The sudoers rule.** It admits the helper only in the argument forms the user side sends, matched whole, and it
+  names the user by id. Every form carries the SHA-256 of the `vpn-root` the release installed: sudo checks it on each
+  call immediately before it runs the helper, and runs the bytes it checked through a file descriptor, so a helper
+  changed after the installation is refused instead of run as root. The helper calls itself by its path, not by `$0`,
+  which under sudo is `/dev/fd/N` and only works while that descriptor is inherited. The verbs only the dispatcher and the units call as root are not
+  in it. `install.sh` removes
+  the rule first and writes it last, once everything else is in place.
+- **The helper.** Every argument is checked against a fixed form before it is used. An interface name goes into an
+  nft batch, so a name with a quote in it could have carried commands of its own; a profile name is a path piece.
+  A config and credentials arrive as bytes on stdin: a helper that opens a path its caller names reads whatever that
+  name points to by the time it opens it. The config itself must not name files either: NetworkManager's importer,
+  which runs as root in the helper, keeps a path for `ca`, `cert`, `key`, `tls-auth`, `tls-crypt`, `secret` and the
+  like and reads it later as root, and for `http-proxy` and `socks-proxy` it reads the credentials file at once into
+  the connection, whose first line you can read back. Scripts (`up`, `down`, `plugin`) it drops, which is why
+  Proton's configs pass; the helper still removes every script and plugin hook from the copy it imports (the
+  connection is the same with and without them, measured), so nothing root runs rests on the importer of whichever
+  NetworkManager is installed. The importer also splits a line at a carriage return or form feed where a check by fields
+  does not, so a control character inside a line is refused before the check, and the same check runs again before
+  every import, for configs stored before it existed. Credentials go to NetworkManager through libnm (Python on
+  stdin), never as an argument of `nmcli`, where the process list would show them. Every input has a limit and is
+  refused above it, not cut. A NetworkManager connection is brought up, taken down and deleted only by UUID and only if
+  it is a VPN, never by a name another connection may carry too. The kill
+  switch lets each server through only on the port and protocol its config names, as pairs, not every listed address
+  on every listed port. Its tools come from `PATH=/usr/bin` only, never from the caller's, and the helper, the
+  installer, the updater and the uninstaller set `LC_ALL=C`, because sudo passes the caller's locale on. The helper
+  starts as `bash -p`, so no `BASH_ENV`, exported function or `SHELLOPTS` from the environment reaches it, even where a
+  site's sudo configuration would pass them on.
+- **The widget.** The processes it starts run by absolute path under `timeout`, with an environment cleared down to
+  what `vpn` needs, and their output is kept only up to 256 KiB: a process that says more is stopped. Everything it
+  shows is plain text, never rich text, and what `vpn json` and `vpn public` hand it is built with `jq`, with every
+  string from the network or a config cleaned of control and direction characters and capped. When the poll fails,
+  the panel says the state is unknown instead of showing the last good one.
+- **Downward, not upward.** Where root has to touch your home (the `vpn` command, the widget, a config you name
+  on the installer's command line), it does so through `sudo -u` with your rights, so a link placed there leads
+  nowhere you could not already go yourself.
 
 ## Design notes
 
@@ -164,7 +244,7 @@ too, otherwise auto-disconnect on a trusted network would tear it down at once.
 - A `gum` wizard instead of a chain of dialogs. Omarchy's own menu input offers neither pre-filled values nor
   masking, and Omarchy itself runs multi step flows in a floating terminal with `gum`. So does this.
 - `vpn status` asks ipinfo.io where the traffic comes out, because the tunnel's own state is not proof of
-  anything. The widget does the same when the state changes, never on a timer.
+  anything. The widget does the same when the state changes, never on a timer, and `vpn lookup off` stops both.
 - English in the UI. Omarchy's menu, bar and notifications are in English and the system runs `LANG=en_US`; a
   German submenu would be a foreign body.
 

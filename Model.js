@@ -16,9 +16,17 @@ function parseState(raw) {
   }
 }
 
+// A string from `vpn json`, whatever arrived: never anything but a string, never longer than n.
+function str(v, n) {
+  return (typeof v === "string" ? v : v === undefined || v === null ? "" : String(v)).slice(0, n)
+}
+function list(v, n) {
+  return v instanceof Array ? v.slice(0, n) : []
+}
+
 function glyphFor(state) {
   if (state === "connected") return GLYPH_LOCK
-  if (state === "down" || state === "stalled") return GLYPH_OFF
+  if (state === "down" || state === "stalled" || state === "unknown") return GLYPH_OFF
   return GLYPH_OUTLINE
 }
 
@@ -29,6 +37,7 @@ function stateTitle(state, busyLabel) {
     case "connecting": return "Connecting…"
     case "stalled": return "Reconnecting…"
     case "down": return "Tunnel down"
+    case "unknown": return "State unknown"
     default: return "Off"
   }
 }
@@ -39,6 +48,8 @@ function heroMeta(d) {
   var name = d.want || d.active || ""
   var label = d.label || ""
   switch (d.state) {
+    case "unknown":
+      return "`vpn json` did not answer · what the tunnel and the kill switch do cannot be shown"
     case "connected":
       return label + " · kill switch " + ksWord(d)
     case "connecting":
@@ -86,6 +97,7 @@ function fuzzy(hay, needle) {
 
 // The full line under the hero: where the internet sees you. Empty while unknown so nothing wobbles.
 function publicLine(p, loading) {
+  if (p && p.lookup === false) return "Public IP lookup is off (vpn lookup on)"
   if (loading && (!p || !p.ip)) return "Looking up where you come out…"
   if (!p || !p.ip) return ""
   var where = p.country || ""
@@ -139,6 +151,7 @@ function networkDescription(d) {
 
 function killswitchDescription(d) {
   if (!d) return ""
+  if (d.state === "unknown") return "unknown: the state could not be read, see the message above"
   if (d.killswitch === "disabled") return "off: profiles, watchdog and icon work as usual, nothing is ever blocked"
   if (d.killswitch === "unloaded") return "NOT LOADED: no table, nothing is blocked - no profile yet, or the unit was stopped (sudo systemctl start vpn-killswitch)"
   if (d.state === "connected") return "on: only the tunnel and the handshake to the VPN servers may leave"
@@ -151,6 +164,7 @@ function barTooltip(d, rates) {
   if (!d) return "tun0 VPN"
   var lines = []
   switch (d.state) {
+    case "unknown": lines.push("VPN state unknown - `vpn json` failed, open the panel for the reason"); break
     case "connected":
       lines.push(d.label + " (" + d.active + "), kill switch " + ksWord(d))
       if (rates) lines.push("↓ " + fmtRate(rates.rx) + "  ↑ " + fmtRate(rates.tx))
@@ -161,6 +175,6 @@ function barTooltip(d, rates) {
     default: lines.push("VPN off" + (d["default"] ? " (default: " + d["default"] + ")" : "") + (d.killswitch === "disabled" ? " · kill switch disabled" : ""))
   }
   if (d.ssid) lines.push("Wi-Fi " + d.ssid + " · " + (d.trusted ? "trusted" : "untrusted"))
-  lines.push("Click: panel · Right-click: " + (d.state === "off" ? "connect" : "disconnect") + " · Middle: refresh")
+  lines.push("Click: panel · Right-click: " + (d.state === "unknown" ? "refresh" : d.state === "off" ? "connect" : "disconnect") + " · Middle: refresh")
   return lines.join("\n")
 }

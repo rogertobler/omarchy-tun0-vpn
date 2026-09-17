@@ -99,7 +99,7 @@ Panel {
         text: row.trailing
         color: row.trailingColor
         font.family: widget.fontFamily
-        // Glyphs read better a size up from the body text (Roger, 2026-09-08 23:39: "die Icons allgemein grösser").
+        // Glyphs read better a size up from the body text.
         font.pixelSize: Style.font.heading
         anchors.verticalCenter: parent.verticalCenter
       }
@@ -116,22 +116,21 @@ Panel {
   }
 
   // ---- the bar face ---------------------------------------------------------------------------
-  // Red means one thing only: the tunnel is down while it is wanted. Connected gets the accent
+  // Red means the tunnel is down while it is wanted, or its state cannot be read. Connected gets the accent
   // (optional), everything else the plain foreground - dimmed while nothing is going on.
-  readonly property string barGlyph: Model.glyphFor(vpn.state)
+  readonly property string barGlyph: Model.glyphFor(vpn.vpnState)
   readonly property string barText: {
-    var name = vpn.state === "off" ? "" : (vpn.want || vpn.active)
+    var name = vpn.vpnState === "off" ? "" : (vpn.want || vpn.active)
     var t = barGlyph
-    if (showName && name) t += " " + name + (vpn.state === "connecting" ? "…" : "")
+    if (showName && name) t += " " + name + (vpn.vpnState === "connecting" ? "…" : "")
     if (showRateInBar && vpn.up) t += "  ↓" + Model.fmtRate(vpn.rxRate)
     return t
   }
-  readonly property color barColor: (vpn.state === "down" || vpn.state === "stalled") ? urgent
+  readonly property color barColor: (vpn.vpnState === "down" || vpn.vpnState === "stalled" || vpn.vpnState === "unknown") ? urgent
                                   : (vpn.up && highlightConnected ? accent : barForeground)
-  readonly property bool pulsing: vpn.state === "connecting" || vpn.state === "down" || vpn.state === "stalled"
+  readonly property bool pulsing: vpn.vpnState === "connecting" || vpn.vpnState === "down" || vpn.vpnState === "stalled"
   // The bar underlines an open module with a mark 55 % of the slot wide by default; with a glyph plus a
-  // name that left the shield out. Same hint the clock widget gives: underline the painted label
-  // (Roger, 2026-09-08 23:41).
+  // name that left the shield out. Same hint the clock widget gives: underline the painted label.
   readonly property real openPanelIndicatorWidth: button.labelWidth
 
   // ---- keyboard cursor over a flat list of rows -------------------------------------------------
@@ -229,7 +228,7 @@ Panel {
     function refresh(): void { vpn.refresh() }
     function up(name: string): void { name ? vpn.connectTo(name) : vpn.toggleTunnel() }
     function down(): void { vpn.disconnect() }
-    function status(): string { return vpn.state + (vpn.active ? " " + vpn.active : "") }
+    function status(): string { return vpn.vpnState + (vpn.active ? " " + vpn.active : "") }
   }
 
   // ---- bar face -------------------------------------------------------------------------------
@@ -245,8 +244,8 @@ Panel {
       foreground: widget.barColor
       useActiveColor: false
       keepSpace: true
-      dimmed: vpn.state === "off" && !widget.opened
-      tooltipText: Model.barTooltip(vpn.data, { rx: vpn.rxRate, tx: vpn.txRate })
+      dimmed: vpn.vpnState === "off" && !widget.opened
+      tooltipText: Model.barTooltip(vpn.view, { rx: vpn.rxRate, tx: vpn.txRate })
       onPressed: function(buttonCode) {
         if (buttonCode === Qt.RightButton) vpn.toggleTunnel()
         else if (buttonCode === Qt.MiddleButton) vpn.refresh()
@@ -256,8 +255,8 @@ Panel {
 
     // The bar label changes width with the state (bare shield -> "shield proton-ch..." -> "shield proton-ch"),
     // and KeyboardPanel centres the card on its anchor. In a right-aligned bar the button grows to the
-    // left, so the open panel slid sideways on every switch (Roger, 2026-09-08 23:25; freezing only the
-    // width made it worse - the anchor's x still moved). The panel anchors to this proxy instead: while
+    // left, so the open panel slid sideways on every switch (freezing only the width made it worse - the
+    // anchor's x still moved). The panel anchors to this proxy instead: while
     // the panel is open it holds the screen position the button had at the moment of opening, whatever
     // the button does meanwhile. It re-centres on the next open.
     Item {
@@ -355,15 +354,16 @@ Panel {
             PanelHero {
               id: hero
               width: parent.width
-              title: Model.stateTitle(vpn.state, vpn.busyLabel)
-              meta: Model.heroMeta(vpn.data)
+              title: Model.stateTitle(vpn.vpnState, vpn.busyLabel)
+              meta: Model.heroMeta(vpn.view)
               foreground: widget.foreground
               fontFamily: widget.fontFamily
               iconOpacity: vpn.wanted ? 1.0 : 0.5
               iconComponent: Component {
                 Text {
+                  textFormat: Text.PlainText
                   text: widget.barGlyph
-                  color: (vpn.state === "down" || vpn.stalled) ? widget.urgent : (vpn.up ? widget.accent : widget.foreground)
+                  color: (vpn.vpnState === "down" || vpn.stalled || vpn.vpnState === "unknown") ? widget.urgent : (vpn.up ? widget.accent : widget.foreground)
                   font.family: widget.fontFamily
                   font.pixelSize: Style.font.display
                 }
@@ -385,6 +385,7 @@ Panel {
 
           // Where the internet sees you - the only real proof the tunnel is doing anything.
           Text {
+            textFormat: Text.PlainText
             visible: text !== ""
             width: parent.width
             text: Model.publicLine(vpn.publicInfo, vpn.publicLoading)
@@ -395,6 +396,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: vpn.errorText !== "" || vpn.notice !== ""
             width: parent.width
             text: vpn.errorText !== "" ? vpn.errorText : vpn.notice
@@ -418,10 +420,10 @@ Panel {
               RowLayout {
                 width: parent.width
                 spacing: Style.space(10)
-                Text { text: "↓ " + Model.fmtRate(vpn.rxRate); color: widget.foreground; font.family: widget.fontFamily; font.pixelSize: Style.font.body }
-                Text { text: "↑ " + Model.fmtRate(vpn.txRate); color: widget.foreground; font.family: widget.fontFamily; font.pixelSize: Style.font.body }
+                Text { textFormat: Text.PlainText; text: "↓ " + Model.fmtRate(vpn.rxRate); color: widget.foreground; font.family: widget.fontFamily; font.pixelSize: Style.font.body }
+                Text { textFormat: Text.PlainText; text: "↑ " + Model.fmtRate(vpn.txRate); color: widget.foreground; font.family: widget.fontFamily; font.pixelSize: Style.font.body }
                 Item { Layout.fillWidth: true }
-                Text { text: "session " + Model.fmtBytes(vpn.sessionRx + vpn.sessionTx); color: widget.dim; font.family: widget.fontFamily; font.pixelSize: Style.font.caption }
+                Text { textFormat: Text.PlainText; text: "session " + Model.fmtBytes(vpn.sessionRx + vpn.sessionTx); color: widget.dim; font.family: widget.fontFamily; font.pixelSize: Style.font.caption }
               }
 
               // Sixty seconds of rates: download in the accent, upload laid over it in the dim tone.
@@ -478,9 +480,10 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: vpn.profiles.length === 0
             width: parent.width
-            text: vpn.loading ? "Checking…" : "No profile yet. Add one with the + above: a file, the clipboard, or a path."
+            text: vpn.loading ? "Checking…" : vpn.failed ? "Profiles unknown while the state cannot be read." : "No profile yet. Add one with the + above: a file, the clipboard, or a path."
             color: widget.dim
             font.family: widget.fontFamily
             font.pixelSize: Style.font.body
@@ -497,7 +500,7 @@ Panel {
                 required property var modelData
                 readonly property string rowId: "profile:" + modelData.name
                 readonly property bool isActive: modelData.active === true
-                readonly property bool isPending: vpn.state === "connecting" && vpn.want === modelData.name
+                readonly property bool isPending: vpn.vpnState === "connecting" && vpn.want === modelData.name
                 width: profileColumn.width
                 label: modelData.label
                 description: Model.profileDescription(modelData)
@@ -505,7 +508,7 @@ Panel {
                 trailingColor: isActive ? widget.accent : widget.foreground
                 current: isActive
                 hasCursor: widget.cursorRowId === rowId
-                enabled: !vpn.busy
+                enabled: !vpn.busy && !vpn.failed
                 onHovered: function(on) { if (on) widget.setCursor(rowId) }
                 onHasCursorChanged: if (hasCursor) widget.reveal(this)
                 onClicked: isActive ? vpn.disconnect() : vpn.connectTo(modelData.name)
@@ -521,15 +524,14 @@ Panel {
           ListRow {
             width: parent.width
             label: "Block everything outside the tunnel"
-            description: Model.killswitchDescription(vpn.data)
+            description: Model.killswitchDescription(vpn.view)
             // One wall glyph: green while the switch is enabled (ready, armed, on, holding), red once you disabled it.
             trailing: "\u{F0587}"
-            trailingColor: vpn.killswitch === "disabled" || vpn.killswitch === "unloaded" ? widget.urgent : widget.accent   // unloaded = setting on, no table: red, not a green promise
-            // Filled while enabled, like every other row that is "on" (Roger, 2026-09-08 23:35: the row was
-            // active but not grey like the others).
-            current: vpn.killswitch !== "disabled"
+            trailingColor: vpn.killswitch === "disabled" || vpn.killswitch === "unloaded" || vpn.killswitch === "unknown" ? widget.urgent : widget.accent   // unloaded = setting on, no table: red, not a green promise
+            // Filled while enabled, like every other row that is "on".
+            current: vpn.killswitch !== "disabled" && vpn.killswitch !== "unknown"
             hasCursor: widget.cursorRowId === "killswitch"
-            enabled: !vpn.busy
+            enabled: !vpn.busy && !vpn.failed
             onHovered: function(on) { if (on) widget.setCursor("killswitch") }
             onHasCursorChanged: if (hasCursor) widget.reveal(this)
             onClicked: vpn.setKillswitch(vpn.killswitch === "disabled")
@@ -539,7 +541,7 @@ Panel {
 
           // -- trusted Wi-Fi: the two automation rows, then the networks. Rows with a glyph, not switches: the
           // master switch at the top is the only switch in the panel, every other on/off is a row that fills
-          // and colours its glyph when on (Roger, 2026-09-08 23:37; glyphs: lightbulb-on/-outline, shield-home). -----------
+          // and colours its glyph when on (glyphs: lightbulb-on/-outline, shield-home). -----------
           RowLayout {
             width: parent.width
             spacing: Style.space(6)
@@ -574,12 +576,12 @@ Panel {
               width: networkColumn.width
               label: "Auto-connect on untrusted Wi-Fi"
               description: "a network you have not trusted is shut before its first packet, then the default profile comes up through it"
-              // A light bulb, lit while on and an outline while off (Roger: "wie eine gute Idee").
+              // A light bulb, lit while on and an outline while off.
               trailing: vpn.autoconnect ? "\u{F06E8}" : "\u{F0336}"
               trailingColor: vpn.autoconnect ? widget.accent : widget.dim
               current: vpn.autoconnect
               hasCursor: widget.cursorRowId === "autoconnect"
-              enabled: !vpn.busy
+              enabled: !vpn.busy && !vpn.failed
               onHovered: function(on) { if (on) widget.setCursor("autoconnect") }
               onHasCursorChanged: if (hasCursor) widget.reveal(this)
               onClicked: vpn.setAutoconnect(!vpn.autoconnect)
@@ -592,7 +594,7 @@ Panel {
               trailingColor: vpn.autodisconnect ? widget.accent : widget.dim
               current: vpn.autodisconnect
               hasCursor: widget.cursorRowId === "autodisconnect"
-              enabled: !vpn.busy
+              enabled: !vpn.busy && !vpn.failed
               onHovered: function(on) { if (on) widget.setCursor("autodisconnect") }
               onHasCursorChanged: if (hasCursor) widget.reveal(this)
               onClicked: vpn.setAutodisconnect(!vpn.autodisconnect)
@@ -613,7 +615,7 @@ Panel {
                 // Same rule as the kill switch row: a trusted network is "on", so its row is filled.
                 current: isTrusted
                 hasCursor: widget.cursorRowId === rowId
-                enabled: !vpn.busy
+                enabled: !vpn.busy && !vpn.failed
                 onHovered: function(on) { if (on) widget.setCursor(rowId) }
                 onHasCursorChanged: if (hasCursor) widget.reveal(this)
                 onClicked: vpn.setTrusted(ssid, !isTrusted)
@@ -621,9 +623,10 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: vpn.knownWifi.length === 0 || (widget.filtering && widget.wifiRows.length === 0)
               width: parent.width
-              text: vpn.knownWifi.length === 0 ? "No saved Wi-Fi networks yet." : "Nothing matches \"" + widget.filterText + "\"."
+              text: vpn.failed ? "Networks unknown while the state cannot be read." : vpn.knownWifi.length === 0 ? "No saved Wi-Fi networks yet." : "Nothing matches \"" + widget.filterText + "\"."
               color: widget.dim
               font.family: widget.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -646,10 +649,11 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             // The one place that lists the keys. The rows used to repeat their own ("s toggles", "d makes it the
-            // default", "c copies the IP"); Roger, 2026-09-09 00:03: space or Enter flips whatever the cursor is on, so
-            // the per-row hints only added noise.
+            // default", "c copies the IP"); space or Enter flips whatever the cursor is on, so the per-row hints
+            // only added noise.
             text: "j/k move · space/enter flips the row · t tunnel · s kill switch · d default · n trust this Wi-Fi · / search · w all networks · a add · x remove · i status · c copy IP · r refresh · esc"
             color: widget.dim
             font.family: widget.fontFamily
